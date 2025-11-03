@@ -1,0 +1,50 @@
+# Ignore All_Fixed_JSON_SPACEE and everything in it
+All_Fixed_JSON_SPACEE/
+
+# Ignore RStudio project files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Ignore RStudio internal directories
+*/.Rproj.user/
+*.Rproj
+
+# Ignore Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.py~
+*.ipynb_checkpoints
+.env/
+.venv/
+env/
+venv/
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore temporary or backup files
+*.swp
+*.tmp
+*.bak
+
+# Ignore large or generated data folders
+All_Raw_Eye_Data/
+Failed_Calibration/
+Final_Collected_Data/
+data/
+import for analysis/
+Tests_Data_Analysis/
+
+# Ignore nested .git folders (e.g., in fht_game_analysis)
+**/.git/
+
+# Ignore outputs and logs
+*.log
+*.out
+*.csv~
+*.json~
