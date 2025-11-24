@@ -14,6 +14,16 @@ import numpy as np
 import pandas as pd
 import tsfel
 import cateyes
+from AOI.eyesmetriccalculator import EyesMetricCalculator
+from AOI.transition_matrix import *
+# Source - https://stackoverflow.com/a
+# Posted by Mike, modified by community. See post 'Timeline' for change history
+# Retrieved 2025-11-24, License - CC BY-SA 4.0
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
 
 thisdir = os.getcwd()
 filenames = []
@@ -152,6 +162,41 @@ def get_gaze_entropy(df, w=1, h=1):
         p_log = np.where(pvals > 0, pvals * np.log2(pvals), 0.0)
     return abs(p_log.sum())
 
+def get_transition_features(df, w=1, h=1):
+    TEST_SCREENDIM = [1, 1.2]  # screen size in pixels
+    vertices = [[0.25,0.25],[0.75,0.25],[0.75,0.75],[0.25,0.75]]#25% of the scree, JASCHA
+    TEST_AOI_DICT = {'aoi_poly1': PolyAOI(TEST_SCREENDIM, vertices)}
+
+    df_fix = df[df['Class'].str.contains('Fixation', na=False)]
+    df_fix = df_fix[df_fix['left_on_display_y'].notna()]
+    if df_fix.empty:
+        return (np.nan, np.nan)
+
+    appended_data = []
+    for fix in df_fix['Segment'].unique():
+        dd = df_fix.loc[df_fix['Segment'] == fix]
+        appended_data.append(dd[['left_on_display_x', 'left_on_display_y']])
+    appended_data = pd.concat(appended_data, ignore_index=True)
+
+    xydf = appended_data.rename(columns={"left_on_display_x":"x","left_on_display_y":"y"})
+    xydf["duration"] = 0
+
+    # Clip to screen bounds (pixels)
+    xydf["x"] = abs(xydf["x"]).clip(0, 1)
+    xydf["y"] = abs(xydf["y"]).clip(0, 1)
+
+    # Convert to gaze array (x, y, duration)
+    gaze_array = xydf[["x","y","duration"]].to_numpy()
+    #print(gaze_array)# sanity check here.
+    ec = EyesMetricCalculator(gaze_array, gaze_array, TEST_SCREENDIM)
+    gte = ec.GEntropy(TEST_AOI_DICT, 'transition').compute()
+    ste = ec.GEntropy(TEST_AOI_DICT, 'stationary').compute()
+    print(gte,ste)
+
+    return (gte, ste)
+
+    
+
 def fixation_saccade_detection(data):
     """Return summary stats for saccades and fixations based on Class & Segment grouping."""
     data = data[data['left_on_display_y'].notna()]
@@ -187,7 +232,7 @@ def get_et_params(data):
     Returns a tuple of 20 items matching the original order you expected.
     """
     if data is None or data.empty:
-        return tuple([np.nan] * 20)
+        return tuple([np.nan] * 22)
 
     x = data['left_on_display_x'].to_numpy()
     y = data['left_on_display_y'].to_numpy()
@@ -203,11 +248,16 @@ def get_et_params(data):
         gaze_entropy = get_gaze_entropy(data)
     except Exception:
         gaze_entropy = np.nan
+    try:
+        gte,ste = get_transition_features(data)
+    except Exception:
+        print("oops")
+        gte=ste = np.nan
 
     return (blink_count, average_blink_duration, max_blink_duration,
             average_saccadic_duration, maximum_saccadic_duration, saccadic_count,
             average_fixation_duration, maximum_fixation_duration, fixation_count,
-            gaze_entropy) + tuple(pupil_feats)
+            gaze_entropy,gte,ste) + tuple(pupil_feats)
 
 # ------------------------------------------------
 # main processing: compute et params for all participants
@@ -328,7 +378,7 @@ for participant in participantsList:
                 if not df_et.loc[mask].empty:
                     et_param = get_et_params(df_et.loc[mask])
                 else:
-                    et_param = tuple([np.nan] * 20)
+                    et_param = tuple([np.nan] * 22)
                 et_params_list.append(list(et_param))
 
     except Exception as e:
@@ -338,10 +388,10 @@ for participant in participantsList:
         num_events = mask_participant.sum()
         if num_events == 0:
             # at least add one row of NaNs
-            et_params_list.append(list([np.nan] * 20))
+            et_params_list.append(list([np.nan] * 22))
         else:
             for _ in range(int(num_events)):
-                et_params_list.append(list([np.nan] * 20))
+                et_params_list.append(list([np.nan] * 22))
 
 # convert into DataFrame and append to results_df
 params_df = pd.DataFrame(et_params_list)
@@ -349,7 +399,7 @@ params_df.columns = [
     'blink_count', 'average_blink_duration', 'max_blink_duration',
     'average_saccadic_duration', 'maximum_saccadic_duration', 'saccadic_count',
     'average_fixation_duration', 'maximum_fixation_duration', 'fixation_count',
-    'gaze_entropy',
+    'gaze_entropy','gte','ste',
     'L_slope', 'L_max', 'L_mean', 'L_entropy', 'L_variation',
     'R_slope', 'R_max', 'R_mean', 'R_entropy', 'R_variation'
 ]
@@ -363,7 +413,11 @@ if params_df.shape[0] < results_df.shape[0]:
 elif params_df.shape[0] > results_df.shape[0]:
     # truncate extra rows (they correspond to extra events detected from xdf files)
     params_df = params_df.iloc[:results_df.shape[0], :].reset_index(drop=True)
+params_df["BA"] = params_df["R_mean"] - params_df["L_mean"]
+df_t = pd.concat([results_df.reset_index(drop=True), params_df.reset_index(drop=True)], axis=1)
+df_t.to_csv("ET_results16356125.csv", index=False)
+print("Saved ET_results16356125.csv")
 
 df_t = pd.concat([results_df.reset_index(drop=True), params_df.reset_index(drop=True)], axis=1)
-df_t.to_csv('ET_results.csv', index=False)
-print("Saved ET_results1.csv")
+df_t.to_csv('ET_results16356125.csv', index=False)
+print("Saved ET_results.csv")
