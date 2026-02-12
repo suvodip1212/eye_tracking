@@ -10,7 +10,7 @@ date: 2024-10-22
 
 ```{r}
 if (!require("pacman")) install.packages("pacman")
-pacman::p_load("readxl","tidyverse","lme4","AER","nlme","lmerTest","randomForest","caret","robustbase","robustlmm","lavaan","semPlot")
+pacman::p_load("readxl","tidyverse","lme4","AER","nlme","lmerTest","randomForest","caret","robustbase","robustlmm")
 ```
 
 Functions
@@ -49,7 +49,27 @@ coalesce_join <- function(x,
 ### Load data
 
 ```{r}
-eye.tracking.data<-read_csv(file = "ET_results1.csv") %>%
+
+training_duration_data <- read_rds("data/training_phases_raw_data.RDS") %>%
+  group_by(Name,Trial) %>%
+  summarise(StartTime = min(Datetime),
+         EndTime = max(Datetime))
+
+pi_trial_duration_data <- read_rds("data/leg_data_path_integration.RDS") %>%
+  group_by(Name,Trial) %>%
+  summarise(StartTime = min(Datetime),
+         EndTime = max(Datetime))
+
+ego_trial_duration_data <- read_rds("data/pointing_trial_raw_data.RDS") %>%
+  group_by(Name,Trial) %>%
+  summarise(StartTime = min(Datetime),
+         EndTime = max(Datetime),
+         totalTime = as.numeric(EndTime-StartTime))
+
+```
+
+```{r}
+eye.tracking.data<-read_xlsx(path = "data/ET_results.xlsx") %>%
   mutate(StartTime = as_datetime(StartTime),
          EndTime = as_datetime(EndTime),
          Phase = case_when(Task=="Path Integration" & is.na(Phase)~"Movement",
@@ -119,25 +139,60 @@ space.data <- mapping.data %>%
   full_join(memory.data%>% 
               rename("totalTime"="TotalTime"), 
             by = join_by(File, Name, ID,StartTime,EndTime,Task,totalTime)) %>%
-  full_join(path.integration.data %>% rename("totalTime"="Time")%>%
+  full_join(pi_trial_duration_data %>% 
+              full_join(path.integration.data,join_by(Name,Trial)) %>%
+              rename("totalTime"="Time")%>%
               mutate(Trial = as.character(Trial),
                      Phase = "Movement"), 
-            by = join_by(File, Name, ID, Task,totalTime)) %>%
+            by = join_by(File, Name, ID, Task,totalTime,StartTime,EndTime)) %>%
   full_join(perspective.taking.data %>% 
               rename("totalTime"="TotalTime") , 
             by = join_by(File, Name, ID, Phase, StartTime, EndTime, Task, totalTime, Trial)) %>%
-  full_join(pointing.data %>%
+  full_join(ego_trial_duration_data %>% full_join(pointing.data,join_by(Name,Trial)) %>%
               mutate(Trial = as.character(Trial),
                      Phase = "Pointing"), 
-            by = join_by(File, Name, ID, Task, Trial, Phase)) %>% 
-  full_join(training.data%>%
+            by = join_by(File, Name, ID, Task, Trial, Phase,StartTime, EndTime,totalTime)) %>% 
+  full_join(training_duration_data %>% full_join(training.data,join_by(Name,Trial))%>%
               rename("totalTime"="Duration")%>%
               mutate(Trial = as.character(Trial)),
             by = join_by(File, Name, ID, Task, Trial, Phase, Distance, PIDistance, PIRatio, PIDistanceError, PIAngle, PIAngleError, FinalX,
 FinalY, Landmark1, Landmark2, TimeRocketLandmark1, TimeLandmark1Landmark2, TimeLandmark2Rocket, DistanceRocketLandmark1,
-DistanceLandmark1Landmark2, DistanceLandmark2Rocket,totalTime))%>%
+DistanceLandmark1Landmark2, DistanceLandmark2Rocket,totalTime,StartTime, EndTime))%>%
   mutate(Name = as.numeric(Name),
          Name = case_when(Name == 32~326,T~Name))
+```
+
+```{r}
+space.mini.data <- space.data %>% 
+  mutate(TMultiMove = as.numeric(Phase == "Movement"),
+         TAngleError = case_when(!is.na(Calculated_Robot_Angle)~Calculated_Robot_Angle,
+                                 T~Estimated_Angle%%180),
+         AngleError = case_when(
+           !is.na(TAngleError)~TAngleError,
+           !is.na(PIAngleError)~PIAngleError,
+           !is.na(Average_Pointing_Error)~Average_Pointing_Error,
+           !is.na(ErrorMeasure)~ErrorMeasure
+         )
+         ) %>%
+  group_by(Task,Name)%>%
+  mutate(MemorySum = case_when(Task=="Memory"~
+                          sum(Move.Duration.Egg+
+                         Move.Duration.Fossil+
+                         Move.Duration.Fruit+
+                         Move.Duration.Gems+
+                         Move.Duration.Rock+
+                         Move.Duration.Water,na.rm = T),
+                         T~NA_real_)) %>%
+  ungroup()%>%
+  select(Name,Task,Phase,Trial,StartTime,EndTime,totalTime, # general meta data
+         AngleError, 
+         DistanceError=PIDistanceError,
+         ER2 = Euc.R2,
+         MemorySum,#Memory task
+         Count = ZoomCount + CorrectionsCount#Perspective-taking task
+         )%>%
+  left_join(demographics.data, join_by(Name==`Player_Name`)) %>%
+  left_join(moca.data, join_by(Name==`Subject ID`))
 ```
 
 ### Merge data
@@ -178,9 +233,7 @@ all.data <- bind_rows(
     distinct(),
   eye.tracking.data %>% filter(Task!="Mapping" & Task!= "Memory"))%>%
   left_join(demographics.data, join_by(Name==`Player_Name`)) %>%
-  left_join(moca.data %>%mutate(`Subject ID` = as.double(`Subject ID`)),  # Convert to double
-    join_by(Name == `Subject ID`)
-  ) %>%
+  left_join(moca.data, join_by(Name==`Subject ID`))  %>%
   coalesce_join(space.data %>% select(-StartTime,-EndTime), by = join_by(Name, Task, Phase, Trial),
             keep = "left",
             join = "left_join")
@@ -428,7 +481,7 @@ clean.data %>% filter(isTransition=="Task") %>%
 ## Modelling
 
 ```{r}
-filtered.data <- clean.data %>%  filter(if_all(c(Performance,PerformanceSum, mean_blink_count, average_blink_duration, max_blink_duration, saccadic_count, average_saccadic_duration, maximum_saccadic_duration, fixation_count, average_fixation_duration, maximum_fixation_duration, gaze_entropy, L_entropy, R_entropy,L_mean,R_mean,L_max,R_max, Age , Gender, Educational_level,
+filtered.data <- clean.data %>%  filter(if_all(c(Performance,PerformanceSum, mean_blink_count, average_blink_duration, max_blink_duration, saccadic_count, average_saccadic_duration, maximum_saccadic_duration, fixation_count, average_fixation_duration, maximum_fixation_duration, gaze_entropy, L_entropy, R_entropy, Age , Gender, Educational_level,
          Depression,
          Anxiety,
          Stress,
@@ -442,8 +495,7 @@ filtered.data <- clean.data %>%  filter(if_all(c(Performance,PerformanceSum, mea
 ### LM
 
 ```{r}
-
-summary(lm(Performance ~  R_mean+ R_max+ mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender +  Educational_level + Depression + Anxiety + Stress  + Sleep + Walking + Physical_activity + Handedness,data=filtered.data))
+summary(lm(Performance ~  mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender +  Educational_level + Depression + Anxiety + Stress  + Sleep + Walking + Physical_activity + Handedness,data=filtered.data))
 
 lm.mod.no.space<-lm(MoCA ~ Age + Gender + Educational_level + Depression + Anxiety + Stress  + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
 summary(lm.mod.no.space)
@@ -454,108 +506,31 @@ summary(lm.mod.no.eye)
 lm.mod.space.only<-lm(MoCA ~ PerformanceSum  ,data=filtered.data)
 summary(lm.mod.space.only)
 
-lm.mod.eye.only<-lm(MoCA ~  R_mean+ mean_blink_count + L_mean+ average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy,data=filtered.data)
+lm.mod.eye.only<-lm(MoCA ~ mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy,data=filtered.data)
 summary(lm.mod.eye.only)
 
-lm.mod.no.space.but.eye<-lm(MoCA ~ R_mean+mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+lm.mod.no.space.but.eye<-lm(MoCA ~ mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
 summary(lm.mod.no.space.but.eye)
 
-lm.mod<-lm(MoCA ~ PerformanceSum  +R_mean+ L_mean+R_max+L_max+ mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+lm.mod<-lm(MoCA ~ PerformanceSum  + mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
 summary(lm.mod)
-
 
 #Performance + mean_blink_count + average_blink_duration+ max_blink_duration + saccadic_count + average_saccadic_duration + maximum_saccadic_duration + fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender
 
-#lm.mod.trans<-lmrob(MoCA ~  PerformanceSum + Task + R_mean + mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
-#summary(lm.mod.trans)
+lm.mod.trans<-lmrob(MoCA ~  PerformanceSum + Task +
+                    + mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+ summary(lm.mod.trans)
 ```
 
 ### Mixed Models
 
 ```{r}
-mixed.lmer2 <- rlmer(MoCA ~  PerformanceSum +Task+L_mean+ mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness + (PerformanceSum|Age), data = filtered.data)
+mixed.lmer2 <- rlmer(MoCA ~  PerformanceSum +Task + mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness + (1|isTransition), data = filtered.data)
 summary(mixed.lmer2)
 ```
-```{r}
-# Define the SEM model
-model <- '
-  # Cognitive ability (MoCA) predicted by physiological + demographic factors
-  MoCA ~ PerformanceSum+R_mean + L_mean + R_max + L_max +
-         mean_blink_count + average_blink_duration + max_blink_duration +
-         mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration +
-         mean_fixation_count + average_fixation_duration + maximum_fixation_duration +
-         gaze_entropy + L_entropy + R_entropy +
-         Age + Gender + Educational_level + Depression + Anxiety + Stress +
-         Falls_number + Sleep + Walking + Physical_activity + Handedness
-
-  # Direct effects of physiological + demographic variables on performance
-  PerformanceSum ~ R_mean + L_mean + R_max + L_max +
-                   mean_blink_count + average_blink_duration + max_blink_duration +
-                   mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration +
-                   mean_fixation_count + average_fixation_duration + maximum_fixation_duration +
-                   gaze_entropy + L_entropy + R_entropy +
-                   Age + Gender + Educational_level + Depression + Anxiety + Stress +
-                   Falls_number + Sleep + Walking + Physical_activity + Handedness
-'
-
-# Fit the SEM
-fit <- sem(model, data = filtered.data, std.lv = TRUE, missing = "fiml")
-
-# Summarize results
-summary(fit, standardized = TRUE, fit.measures = TRUE, rsquare = TRUE)
-
-#plot
-# Visualize the fitted SEM model
-semPaths(fit,
-         what = "std",             # standardized coefficients
-         layout = "tree",          # hierarchical layout
-         style = "lisrel",         # cleaner node style
-         whatLabels = "std",       # display standardized values
-         edge.label.cex = 1,     # smaller label size
-         nCharNodes = 10,          # shorten variable names
-         sizeMan = 6,              # node size
-         residuals = FALSE,
-         intercepts = FALSE,
-         title = TRUE,
-         curvePivot = TRUE,
-         mar = c(4, 4, 4, 4))
-```
-```{r}
-# Extract parameter estimates
-pe <- parameterEstimates(fit, standardized = TRUE) %>%
-  filter(op == "~") %>%   # only regression paths
-  mutate(response = lhs, predictor = rhs)
-
-# Split by dependent variable
-moca_effects <- pe %>% filter(response == "MoCA")
-perf_effects <- pe %>% filter(response == "PerformanceSum")
-
-# Plot for MoCA predictors
-ggplot(moca_effects, aes(x = reorder(predictor, std.all), y = std.all, fill = pvalue < 0.05)) +
-  geom_bar(stat = "identity") +
-  coord_flip() +
-  theme_minimal() +
-  labs(title = "Predictors of MoCA",
-       x = "Predictor", y = "Standardized Effect") +
-  scale_fill_manual(values = c("gray70", "steelblue"),
-                    labels = c("n.s.", "p < 0.05"),
-                    name = "Significance")
-
-# Plot for PerformanceSum predictors
-ggplot(perf_effects, aes(x = reorder(predictor, std.all), y = std.all, fill = pvalue < 0.05)) +
-  geom_bar(stat = "identity") +
-  coord_flip() +
-  theme_minimal() +
-  labs(title = "Predictors of Performance",
-       x = "Predictor", y = "Standardized Effect") +
-  scale_fill_manual(values = c("gray70", "darkgreen"),
-                    labels = c("n.s.", "p < 0.05"),
-                    name = "Significance")
-
-```
 
 ```{r}
-mixed.lmer3 <- lme(MoCA ~  Performance +R_mean+ mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level +Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness, data = filtered.data, random = ~ 1|Task )
+mixed.lmer3 <- lme(MoCA ~  Performance + mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level +Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness, data = filtered.data, random = ~ 1|Task )
 summary(mixed.lmer3)
 ```
 
@@ -564,7 +539,7 @@ MoCA <- filtered.data %>% select(MoCA)
 MoCA$predicted <- predict(mixed.lmer3)
 #MoCA.sum <- MoCA %>% group_by(binary_MoCA)%>%
 #  summarise(x=cur_group_id(),predicted=mean(predicted))
-ggplot(data=MoCA,aes(x=MoCA,y=predicted))+geom_point(aes(color=filtered.data$Participant))+geom_smooth(method="lm")+geom_segment(aes(x=min(MoCA),y=min(MoCA),xend=max(MoCA),yend=max(MoCA)),color="darkred")#+geom_line(data=MOCA,aes(x=x,y=predicted),color="blue")
+ggplot(data=MoCA,aes(x=MoCA,y=predicted))+geom_point(aes(color=filtered.data$Participant))+geom_smooth(method="lm")+geom_segment(aes(x=min(MoCA),y=min(MoCA),xend=max(MoCA),yend=max(MoCA)),color="darkred")#+geom_line(data=MoCA.sum,aes(x=x,y=predicted),color="blue")
 ```
 
 ### Instrumental variable
@@ -581,7 +556,7 @@ d2 <- filtered.data[,c(9:13,15:39,40,42:50)] %>%
   rownames_to_column(var = 'var1') %>%
   gather(var2, value, -var1)
 ivreg <- ivreg(MoCA ~ PerformanceSum + Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness  | 
-                    R_max+mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness , data=filtered.data)
+                    mean_blink_count + average_blink_duration+ max_blink_duration + mean_saccadic_count + average_saccadic_duration + maximum_saccadic_duration + mean_fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness , data=filtered.data)
 summary(ivreg)
 coeftest(ivreg, vcov = vcovHC, type = "HC1")
 
@@ -603,10 +578,10 @@ predict(ivreg)
 
 ```{r}
 seed=1351
-train_participants <- tibble(Participants=as.numeric(unique(as.character(clean.data$Participant)))) %>% slice_sample(prop=0.8) 
+train_participants <- tibble(Participants=as.numeric(unique(as.character(clean.data$Participant)))) %>% slice_sample(prop=0.5) 
 train <- clean.data %>% na.omit()  %>% filter(Participant %in% train_participants$Participants)  %>% mutate(id=row_number(),MoCA=factor(binary_MoCA)) %>% select(-scaled_MoCA,-binary_MoCA)
 test <- clean.data %>% na.omit()  %>% filter(Participant %notin% train_participants$Participants) %>% mutate(id=row_number(),MoCA=factor(binary_MoCA)) %>% select(-scaled_MoCA,-binary_MoCA)
-rf <- randomForest(MoCA~PerformanceSum +R_mean+ mean_blink_count + average_blink_duration+ max_blink_duration + saccadic_count + average_saccadic_duration + maximum_saccadic_duration + fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness, ntree = 1000, data=train, proximity=FALSE)
+rf <- randomForest(MoCA~PerformanceSum + mean_blink_count + average_blink_duration+ max_blink_duration + saccadic_count + average_saccadic_duration + maximum_saccadic_duration + fixation_count + average_fixation_duration + maximum_fixation_duration + gaze_entropy + L_entropy + R_entropy+ Age + Gender + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness, ntree = 1000, data=train, proximity=TRUE)
 rf
 p1 <- predict(rf, train)
 confusionMatrix(p1, train$MoCA)

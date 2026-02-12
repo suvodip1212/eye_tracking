@@ -6,6 +6,11 @@ All_Fixed_JSON_SPACEE/
 .Rhistory
 .RData
 .Ruserdata
+*.RData
+*.RDS
+# Ignore libary files
+i_space_files
+catboost_info
 
 # Ignore RStudio internal directories
 */.Rproj.user/

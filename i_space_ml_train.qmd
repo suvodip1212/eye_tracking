@@ -1,0 +1,708 @@
+---
+title: "i_space"
+author: Jascha Grübel
+date: 2024-10-22
+---
+
+# iSPACE
+
+# Setup
+
+## Dev-Packages
+
+```{r eval=F}
+install.packages('remotes')
+remotes::install_github("curso-r/treesnip@catboost",force=T)
+remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.8/catboost-R-darwin-universal2-1.2.8.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load", "--no-staged-install"))
+```
+
+## Packages
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  #workflow
+  tidyverse,caret,janitor,dplyr,rsample,recipes,parsnip,
+  tune,dials,workflows,yardstick,bonsai,doParallel,fastDummies,
+  #modelling
+  randomForest,catboost,xgboost,lightgbm,
+  #Visualisation
+  ggplot2,vip,kernelshap,corrr,rcompanion,GGally,
+  #SHAP
+  shapviz,SHAPforxgboost) 
+
+```
+
+## Settings
+
+```{r}
+# speed up computation with parallel processing
+all_cores <- parallel::detectCores(logical = FALSE) 
+registerDoParallel(cores = all_cores) 
+
+# set the random seed so we can reproduce any simulated results.
+set.seed(1234)
+```
+
+## Functions
+
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+clean.labels<-function(x) {
+  x %>%
+    gsub("'", "", .) %>%
+    gsub("\"", "", .) %>%
+    gsub("%", "percent", .) %>%
+    gsub("^[ ]+", "", .) %>%
+    make.names(.) %>%
+    gsub("[.]+", "_", .) %>%
+    gsub("[_]+", "_", .) %>%
+    tolower(.) %>%
+    gsub("_$", "", .)
+}
+
+# Calculate a pairwise association between all variables in a data-frame. In particular nominal vs nominal with Chi-square, numeric vs numeric with Pearson correlation, and nominal vs numeric with ANOVA.
+# Adopted from https://stackoverflow.com/a/52557631/590437
+mixed_assoc = function(df, cor_method="spearman", adjust_cramersv_bias=TRUE){
+    df_comb = expand.grid(names(df), names(df),  stringsAsFactors = F) %>% set_names("X1", "X2")
+   
+    is_nominal = function(x) class(x) %in% c("factor", "character")
+    # https://community.rstudio.com/t/why-is-purr-is-numeric-deprecated/3559
+    # https://github.com/r-lib/rlang/issues/781
+    is_numeric <- function(x) { is.integer(x) || is_double(x)}
+
+    f = function(xName,yName) {
+        x =  pull(df, xName)
+        y =  pull(df, yName)
+
+        result = if(is_nominal(x) && is_nominal(y)){
+            # use bias corrected cramersV as described in https://rdrr.io/cran/rcompanion/man/cramerV.html
+            cv = cramerV(as.character(x), as.character(y), bias.correct = adjust_cramersv_bias)
+            data.frame(xName, yName, assoc=cv, type="cramersV")
+
+        }else if(is_numeric(x) && is_numeric(y)){
+            correlation = cor(x, y, method=cor_method, use="complete.obs")
+            data.frame(xName, yName, assoc=correlation, type="correlation")
+
+        }else if(is_numeric(x) && is_nominal(y)){
+            # from https://stats.stackexchange.com/questions/119835/correlation-between-a-nominal-iv-and-a-continuous-dv-variable/124618#124618
+            r_squared = summary(lm(x ~ y))$r.squared
+            data.frame(xName, yName, assoc=sqrt(r_squared), type="anova")
+
+        }else if(is_nominal(x) && is_numeric(y)){
+            r_squared = summary(lm(y ~x))$r.squared
+            data.frame(xName, yName, assoc=sqrt(r_squared), type="anova")
+
+        }else {
+            warning(paste("unmatched column type combination: ", class(x), class(y)))
+        }
+
+        # finally add complete obs number and ratio to table
+        result %>% mutate(complete_obs_pairs=sum(!is.na(x) & !is.na(y)), complete_obs_ratio=complete_obs_pairs/length(x)) %>% rename(x=xName, y=yName)
+    }
+
+    # apply function to each variable combination
+    map2_df(df_comb$X1, df_comb$X2, f)
+}
+```
+
+## Data
+
+### Load data
+
+```{r}
+filtered.raw <- readRDS("filtered.RDS") 
+
+#TODO confert Visual_details (col 58) into meaningful categories  
+cols_to_use <- c(1,4,5,8,10,12,
+                 15,16,18:50,52:57,59,60)
+
+
+filtered.data <- filtered.raw %>% select(all_of(cols_to_use)) %>%
+  mutate(education = case_when(Educational_level == "University degree"~1,T~0),
+         is_transition = case_when(isTransition == "Transition"~1,T~0),
+         task = case_when(str_detect(Task,">")~"Waiting",T~Task),
+         male = case_when(Gender == "Male"~1,T~0),
+         right_handed = case_when(Handedness == "Right handed"~1,T~0),
+         task = clean.labels(task) )%>%
+  #dummy_cols(select_columns = "task",omit_colname_prefix = T)%>%
+  select(#-task,
+    -Task,-Educational_level,-Gender, -Gender_identity,-Age_Group,-isTransition,-Handedness)%>%
+    janitor::clean_names() %>% mutate_if(is.character, factor) %>%
+  filter(task=="training")
+    
+clean.raw <-readRDS("clean.RDS") 
+clean.data <- clean.raw %>% select(all_of(cols_to_use)) %>%
+  mutate(education = case_when(Educational_level == "University degree"~1,T~0),
+         is_transition = case_when(isTransition == "Transition"~1,T~0),
+         task = case_when(str_detect(Task,">")~"Waiting",T~Task),
+         male = case_when(Gender == "Male"~1,T~0),
+         right_handed = case_when(Handedness == "Right handed"~1,T~0),
+         task = clean.labels(task) )%>%
+  #dummy_cols(select_columns = "task",omit_colname_prefix = T)%>%
+  select(#-task,
+    -Task,-Educational_level,-Gender, -Gender_identity,-Age_Group,-isTransition,-Handedness)%>%
+    janitor::clean_names() %>% mutate_if(is.character, factor)%>%
+  filter(task=="training") %>% na.omit()
+
+
+```
+
+### Data inspection
+
+```{r}
+
+mydata.cor = cor(clean.data %>% select_if(is.numeric))
+corrplot::corrplot(mydata.cor,order = "hclust",diag=T,tl.cex = 0.75)
+reduced.data <- clean.data %>% 
+  select(
+    #Correlated with average duration
+    -maximum_fixation_duration,-maximum_saccadic_duration,-max_blink_duration,
+    #Snellen right correlated with left but left has less correlation with age
+    -snellen_right,
+    #Walking and physical are similar
+    -walking,
+    #L/R mean/Max highly correlated, use l_mean with lowest correlation to other variables
+    -r_max,-r_mean,-l_max,
+    #entropy, GTE; STE somewhat correlated but GTE/STE has same correlation structure
+    -ste,
+    #mean saccadic/fixation count highly correlated, use fixations
+    -mean_saccadic_count,
+    #counts correlated strongly with duration, only keep time
+    -blink_count,-saccadic_count,-fixation_count,
+    #L/R entropy/variation is highly correlated, use r_variation because is most different
+    -l_entropy,-r_entropy,-l_variation,
+    #aid strength l/r highly correlated, keep left as snellen kept right
+    -aid_strength_left,
+    #depression, anxiety, strees are highly correlated, keep depression for correlation with others
+    -anxiety,-stress
+    )
+
+
+mydata.cor = cor(reduced.data %>% select_if(is.numeric))
+corrplot::corrplot(mydata.cor,order = "hclust",diag=T,tl.cex = 0.75)
+
+ggpairs(clean.data %>% select(-participant,-task), aes(colour = task, alpha = 0.4))
+
+clean.data %>%
+    #select(- name) %>%
+    mixed_assoc() %>%
+    select(x, y, assoc) %>%
+    spread(y, assoc) %>%
+    column_to_rownames("x") %>%
+    as.matrix %>%
+    as_cordf %>%
+    network_plot()
+
+```
+
+### Split data
+
+```{r}
+reduced.split <- rsample::group_initial_split(
+    reduced.data, 
+    group = participant,
+    prop = 0.7, 
+    strata = mo_ca
+)
+
+filtered.split <- rsample::group_initial_split(
+    filtered.data , 
+    group = participant,
+    prop = 0.8, 
+    strata = mo_ca
+)
+
+clean.split <- rsample::group_initial_split(
+    clean.data ,  
+    group = participant,
+    prop = 0.8, 
+    strata = mo_ca
+)
+```
+
+## Recipe
+
+```{r}
+reduced.recipe <- 
+    recipes::recipe(performance_log ~ ., 
+                    data = training(reduced.split)) %>% 
+  update_role(participant, new_role = "id")%>%
+  update_role(mo_ca, new_role = "external")%>%
+    # convert categorical variables to factors
+    recipes::step_string2factor(all_nominal()) %>%
+    # combine low frequency factor levels
+    recipes::step_other(all_nominal(), threshold = 0.001) %>%
+    # remove no variance predictors which provide no predictive information 
+    recipes::step_nzv(all_nominal()) %>%
+    # prep the recipe so it can be used on other data
+    prep()
+
+model.formula <- formula(reduced.recipe)
+
+filtered.recipe <- 
+    recipes::recipe(mo_ca ~ ., 
+                    data = training(filtered.split)) %>% 
+  update_role(participant, new_role = "id")%>%
+    # convert categorical variables to factors
+    recipes::step_string2factor(all_nominal()) %>%
+    # combine low frequency factor levels
+    recipes::step_other(all_nominal(), threshold = 0.001) %>%
+    # remove no variance predictors which provide no predictive information 
+    recipes::step_nzv(all_nominal()) %>%
+    # prep the recipe so it can be used on other data
+    prep()
+
+model.filtered.formula <- formula(filtered.recipe)
+
+clean.recipe <-
+    recipes::recipe(mo_ca ~ ., data = training(clean.split)) %>%
+    # convert categorical variables to factors
+    recipes::step_string2factor(all_nominal()) %>%
+    # combine low frequency factor levels
+    recipes::step_other(all_nominal(), threshold = 0.01) %>%
+    # remove no variance predictors which provide no predictive information 
+    recipes::step_nzv(all_nominal()) %>%
+    # prep the recipe so it can be used on other data
+    prep()
+```
+
+### Cross-validation folds
+
+```{r}
+reduced.cv.folds <- 
+    recipes::bake(
+        reduced.recipe, 
+        new_data = training(reduced.split)
+    ) %>%  
+    rsample::group_vfold_cv(group=participant,v = 5)
+
+
+filtered.cv.folds <- 
+    recipes::bake(
+        filtered.recipe, 
+        new_data = training(filtered.split)
+    ) %>%  
+    rsample::group_vfold_cv(group=participant,v = 5)
+
+
+clean.cv.folds <- 
+    recipes::bake(
+        clean.recipe, 
+        new_data = training(clean.split)
+    ) %>%  
+    rsample::group_vfold_cv(group=participant,v = 5)
+```
+
+## Models
+
+### Catboost
+
+```{r}
+catboost_model<- 
+    parsnip::boost_tree(
+        mode = "regression",
+        trees = tune(),
+        min_n = 5,
+        learn_rate = tune(),
+        tree_depth = tune()
+    ) %>%
+    set_engine("catboost", loss_function = "RMSE")
+
+catboost_params <- 
+    dials::parameters(
+        trees(range = c(50,500)),
+        tree_depth(range = c(4,10)), # depth
+        # In most cases, the optimal depth ranges from 4 to 10. 
+        # Values in the range from 6 to 10 are recommended. 
+        learn_rate() # learning rate
+    )
+
+catboost.grid <- 
+    dials::grid_space_filling(
+        catboost_params, 
+        size = 20 # set this to a higher number to get better results
+        # I don't want to run this all night, so I set it to 30
+    )
+
+catboost.workflow <- 
+    workflows::workflow() %>%
+    add_model(catboost_model
+             ) %>% 
+    add_formula(mo_ca ~ .)
+```
+
+### XGBoost
+
+```{r}
+xgboost_model <- 
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 1500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+    set_engine("xgboost", objective = "reg:squarederror")
+
+xgboost_params <- 
+  dials::parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+
+xgboost_grid <- 
+  dials::grid_space_filling(
+    xgboost_params, 
+    size = 60
+  )
+
+xgboost_wf <- 
+  workflows::workflow() %>%
+  add_model(xgboost_model) %>%
+  add_formula(model.formula)
+```
+
+### LightGBM
+
+```{r}
+lightgbm_model<- 
+    parsnip::boost_tree(
+        mode = "regression",
+        trees = 1000,
+        min_n = tune(),
+        tree_depth = tune(),
+    ) %>%
+    set_engine("lightgbm", objective = "regression",verbose=-1)
+
+lightgbm_params <- 
+    dials::parameters(
+      # The parameters have sane defaults, but if you have some knowledge 
+      # of the process you can set upper and lower limits to these parameters.
+        min_n(), # 2nd important
+        tree_depth() # 3rd most important
+    )
+
+lgbm_grid <- 
+    dials::grid_space_filling(
+        lightgbm_params, 
+        size = 30 # set this to a higher number to get better results
+        # I don't want to run this all night, so I set it to 30
+    )
+
+lgbm_wf <- 
+    workflows::workflow() %>%
+    add_model(lightgbm_model
+             ) %>% 
+    add_formula(mo_ca ~ .)
+```
+
+# Training
+
+## Catboost
+
+```{r}
+filtered.catboost.tuned <- tune::tune_grid(
+    object = catboost.workflow,
+    resamples = filtered.cv.folds,
+    grid = catboost.grid,
+    metrics = yardstick::metric_set(rmse, rsq, mae),
+    control = tune::control_grid(verbose = T) # set this to TRUE to see
+    # in what step of the process you are. But that doesn't look that well in
+    # a blog.
+)
+
+filtered.catboost.tuned %>%
+    tune::show_best(metric = "rmse",n = 5) 
+
+filtered.catboost.tuned %>%  
+  tune::show_best(metric = "rmse",n = 10) %>% 
+  tidyr::pivot_longer(trees:learn_rate, names_to="variable",values_to="value" ) %>% 
+  ggplot(aes(value,mean)) + 
+  geom_line(alpha=1/2)+ 
+  geom_point()+ 
+  facet_wrap(~variable,scales = "free")+
+  ggtitle("Best parameters for RMSE")
+
+filtered.catboost.tuned %>%  
+  tune::show_best(metric = "mae",n = 10) %>% 
+  tidyr::pivot_longer(trees:learn_rate, names_to="variable",values_to="value" ) %>% 
+  ggplot(aes(value,mean)) + 
+  geom_line(alpha=1/2)+ 
+  geom_point()+ 
+  facet_wrap(~variable,scales = "free")+
+  ggtitle("Best parameters for MAE")
+```
+
+```{r}
+filtered.cbst.params <- 
+  filtered.catboost.tuned %>%
+    tune::select_best(metric="rmse")
+
+filtered.cbst.model <- 
+  catboost_model%>% 
+  finalize_model(filtered.cbst.params)
+```
+
+```{r eval=F}
+# create train set
+filtered.train.processed <- bake(filtered.recipe,  new_data = training(filtered.split))
+# fit model on entire trainset
+trained.model.all.data <- filtered.cbst.model %>%
+    # fit the model on all the training data
+    fit(
+        formula = mo_ca ~ ., 
+        data    = filtered.train.processed
+    )
+train_prediction <- 
+    trained.model.all.data %>% 
+    predict(new_data = filtered.train.processed) %>%
+    bind_cols(training(filtered.split))
+
+train_prediction %>%
+    yardstick::metrics(mo_ca, .pred) %>% 
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>% 
+  knitr::kable()
+```
+
+## XGBoost
+
+```{r}
+xgboost_tuned <- tune::tune_grid(
+  object = xgboost_wf,
+  resamples = reduced.cv.folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+xgboost_tuned %>%
+  tune::show_best(metric = "rmse") %>%
+  knitr::kable()
+
+xgboost_best_params <- xgboost_tuned %>%
+  tune::select_best(metric="rmse")
+
+knitr::kable(xgboost_best_params)
+
+xgboost_model_final <- xgboost_model %>% 
+  finalize_model(xgboost_best_params)
+
+train_processed <- bake(reduced.recipe,  new_data = training(reduced.split))
+
+train_prediction <- xgboost_model_final %>%
+  # fit the model on all the training data
+  fit(
+    formula = model.formula, 
+    data    = train_processed
+  ) %>%
+  # predict the sale prices for the training data
+  predict(new_data = train_processed) %>%
+  bind_cols(training(reduced.split))
+
+xgboost_score_train <- 
+  train_prediction %>%
+  yardstick::metrics(mo_ca, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+
+knitr::kable(xgboost_score_train)
+```
+
+## LightGBM
+
+```{r}
+lgbm_tuned <- tune::tune_grid(
+    object = lgbm_wf,
+    resamples = filtered.cv.folds,
+    grid = lgbm_grid,
+    metrics = yardstick::metric_set(rmse, rsq, mae),
+    control = tune::control_grid(verbose = T) # set this to TRUE to see
+    # in what step of the process you are. But that doesn't look that well in
+    # a blog.
+)
+
+lgbm_tuned %>%
+    tune::show_best(metric = "rmse",n = 5) 
+
+lgbm_tuned %>%  
+  tune::show_best(metric = "rmse",n = 10) %>% 
+  tidyr::pivot_longer(min_n:tree_depth, names_to="variable",values_to="value" ) %>% 
+  ggplot(aes(value,mean)) + 
+  geom_line(alpha=1/2)+ 
+  geom_point()+ 
+  facet_wrap(~variable,scales = "free")+
+  ggtitle("Best parameters for RMSE")
+
+lgbm_tuned %>%  
+  tune::show_best(metric = "mae",n = 10) %>% 
+  tidyr::pivot_longer(min_n:tree_depth, names_to="variable",values_to="value" ) %>% 
+  ggplot(aes(value,mean)) + 
+  geom_line(alpha=1/2)+ 
+  geom_point()+ 
+  facet_wrap(~variable,scales = "free")+
+  ggtitle("Best parameters for MAE")
+
+lgbm_best_params <- 
+  lgbm_tuned %>%
+    tune::select_best(metric = "rmse")
+
+lgbm_model_final <- 
+  lightgbm_model%>% 
+  finalize_model(lgbm_best_params)
+```
+
+# Test
+
+## Catboost
+
+```{r}
+test_processed  <- bake(filtered.recipe, new_data = testing(filtered.split))
+test_prediction <- 
+    trained.model.all.data %>% 
+    # use the training model fit to predict the test data
+    predict(new_data = test_processed) %>%
+    bind_cols(testing(filtered.split))
+
+test_prediction %>%
+    yardstick::metrics(mo_ca, .pred) %>% 
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>% 
+  knitr::kable()
+
+house_prediction_residual <- test_prediction %>%
+    arrange(.pred) %>%
+    mutate(residual_moca = (mo_ca - .pred) / .pred) %>%
+    select(.pred, residual_moca)
+
+ggplot(house_prediction_residual, aes(x = .pred, y = residual_moca)) +
+    geom_point() +
+    xlab("MoCa Score") +
+    ylab("Residual (%)") +
+    scale_x_continuous(labels = scales::number) +
+    scale_y_continuous(labels = scales::percent)
+
+```
+
+## XGBoost
+
+```{r}
+
+test_processed  <- bake(reduced.recipe, new_data = testing(reduced.split))
+test_prediction <- xgboost_model_final %>%
+  # fit the model on all the training data
+  fit(
+    formula = model.formula, 
+    data    = train_processed
+  ) %>%
+  # use the training model fit to predict the test data
+  predict(new_data = test_processed) %>%
+  bind_cols(testing(reduced.split))
+
+# measure the accuracy of our model using `yardstick`
+xgboost_score <- 
+  test_prediction %>%
+  yardstick::metrics(mo_ca, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+
+knitr::kable(xgboost_score)
+
+house_prediction_residual <- test_prediction %>%
+  arrange(.pred) %>%
+  mutate(residual_moca = (mo_ca - .pred) / .pred) %>%
+  select(.pred, residual_moca)
+
+ggplot(house_prediction_residual, aes(x = .pred, y = residual_moca)) +
+  geom_point() +
+  xlab("MoCa Score") +
+  ylab("Residual (%)") +
+  scale_x_continuous(labels = scales::number) +
+  scale_y_continuous(labels = scales::percent)
+```
+
+## LightGBM
+
+```{r}
+test_processed  <- bake(filtered.recipe, new_data = testing(filtered.split))
+
+test_prediction <- lgbm_model_final %>%
+  # fit the model on all the training data
+  fit(
+    formula = mo_ca ~ ., 
+    data    = train_processed
+  ) %>%
+  # use the training model fit to predict the test data
+  predict(new_data = test_processed) %>%
+  bind_cols(testing(filtered.split))
+
+# measure the accuracy of our model using `yardstick`
+lightgbm_score <- 
+  test_prediction %>%
+  yardstick::metrics(mo_ca, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+
+knitr::kable(lightgbm_score)
+
+house_prediction_residual <- test_prediction %>%
+  arrange(.pred) %>%
+  mutate(residual_moca = (mo_ca - .pred) / .pred) %>%
+  select(.pred, residual_moca)
+
+ggplot(house_prediction_residual, aes(x = .pred, y = residual_moca)) +
+  geom_point() +
+  xlab("MoCa Score") +
+  ylab("Residual (%)") +
+  scale_x_continuous(labels = scales::number) +
+  scale_y_continuous(labels = scales::percent)
+```
+
+# SHAP Shapley Additive Explanations
+
+```{r}
+df_test <- testing(reduced.split)
+xvars <- names(df_test)[-1]
+X_explain <- df_test[, xvars]  # Use only feature columns
+
+
+fit <- xgboost_model_final %>%
+    # fit the model on all the training data
+    fit(
+        formula = model.formula, 
+        data    = train_processed
+    )
+
+
+# 1.5 minutes on laptop
+# Note: If you have more than p=8 features, use kernelshap() instead of permshap()
+system.time(
+  shap_values <- fit |> 
+    permshap(X = X_explain, 
+             feature_names = xvars,
+             exact = FALSE) |> 
+    shapviz()
+)
+ saveRDS(shap_values, file = "shap_values.rds")
+ shap_values <- readRDS("shap_values.rds")
+
+shap_values |> 
+  sv_importance("bee", max_display = 15,size = 0.5)
+
+shap_values |> 
+  sv_dependence(c("interviewer","l_mean","ba","physical_activity","sleep","aid_strength_left"), color_var = "auto")
+
+
+shap_values |> 
+  sv_force(row_id = 5)
+
+
+shap_values |> 
+  sv_waterfall(row_id = c(40))
+
+
+sv_importance(shap_values, kind = "both", show_numbers = TRUE)
+sv_dependence(shap, "carat", color_var = "auto")
+sv_dependence(shap, "clarity", color_var = "auto")
+sv_force(shap, row_id = 1)
+sv_waterfall(shap, row_id = 1)
+```

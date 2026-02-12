@@ -1,0 +1,387 @@
+---
+title: "i_space"
+author: Jascha Grübel
+date: 2024-10-22
+---
+
+# iSPACE
+
+## Setup
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load("readxl","tidyverse","lme4","AER","nlme","lmerTest","randomForest","caret","robustbase","robustlmm","lavaan","semPlot","tidyr","broom","lavaanPlot","tidySEM","fastDummies","texreg","StanHeaders", "rstan","blavaan","remotes","corrplot") 
+
+if(Sys.info()["sysname"] == "Darwin"){#is on Mac
+  #remotes::install_github("coatless-mac/macrtools")
+  #macrtools::macos_rtools_install()
+} else {
+  warning("PLEASE INSTALL STAN FOR WINDOWS: Install RTools43 following the instructions here: https://cran.r-project.org/bin/windows/Rtools/rtools43/rtools.html")
+}
+
+```
+
+Functions
+
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+coalesce_join <- function(x, 
+                          y, 
+                          by = NULL, 
+                          keep = c("left", "right"), # "left" means keep value from left table if values exist in both tables.
+                          suffix = c(".x", ".y"), # Same as the suffix argument in dplyr joins. 
+                          join = c("full_join","left_join", "right_join", "inner_join") # Choose a join type from the list. The default is full_join.
+                          ) { 
+  keep = match.arg(keep) 
+  join = match.arg(join) 
+  join = match.fun(join) # Confirm the join argument is in the list and match the string to the function
+  
+  # Depends on the keep argument, overwrite the duplicate value
+  # If keep = "left", the value from the left table will be kept, vice versa.
+  if (keep == "left") suffix_ = suffix else suffix_ = rev(suffix)
+  
+  join(x, y, by = by, suffix = suffix) %>% 
+    mutate(
+      across( # Apply the coalesce function to all overlapped columns
+        ends_with(suffix_[1]), # Select columns ended with .x if keep = "left"; or .y if keep = "right"
+        ~coalesce(.,
+                  get(str_replace(cur_column(), suffix_[1], suffix_[2])) # Replace .x in var.x with .y to generate var.y, if keep = "left"; or vice versa.
+        ),
+        .names = "{str_remove(.col, suffix_[1])}" # Remove the suffix from the combined columns
+      ),
+      .keep = "unused") # Remove the temporary columns ended with suffix
+  }
+```
+
+### Load data
+
+```{r}
+eye.tracking.data<-read_csv(file = "ET_results_with_AOI.csv") %>%
+  mutate(StartTime = as_datetime(StartTime),
+         EndTime = as_datetime(EndTime),
+         Phase = case_when(Task=="Path Integration" & is.na(Phase)~"Movement",
+                           Task=="Perspective Taking" & is.na(Phase)~"Rotating",
+                           Task=="Egocentric pointing" & is.na(Phase)~"Pointing",
+                           T~Phase)) %>%
+  group_by(Name,Task) %>%
+    mutate(index = which(Phase=="HomingMultiLegs")[1],
+           row = row_number(),
+           Phase = case_when(row>=index & Phase == "Transition"~"HomingMultiLegs", 
+                             row>=index & !is.na(Trial) ~ "Transition",T~Phase),
+           Trial = case_when(row>=index~lag(Trial,default=NA),
+                             Task=="Perspective Taking"~paste(Trial,Leg),
+                             T~Trial),
+           Leg = case_when(Task=="Perspective Taking"~as.character((row-1)/2),
+                           T~Leg))%>%
+  filter(Task != "Training" | row!=index)%>%
+  select(-row,-index)
+moca.data<-read_xlsx(path = "data/EyeT_RawMoCAScore.xlsx")
+demographics.data<-read_xlsx(path = "data/EyeT_Demographic.xlsx")
+
+mapping.data <- read_rds(file = "data/mapping_meta_data.RDS") %>% 
+  mutate(Task = "Mapping")
+memory.data <- read_rds(file = "data/memory_meta_data.RDS") %>% 
+  mutate(Task = "Memory") 
+path.integration.data <- read_rds(file = "data/trial_meta_data_path_integration.RDS") %>% 
+  mutate(Task = "Path Integration")
+perspective.taking.data <- read_rds(file = "data/trial_meta_data_perspective_taking.RDS") %>% 
+  mutate(Task = "Perspective Taking")%>%
+              mutate(TrialOld = Trial,
+                     Trial = paste(Landmark.Facing,Landmark.Target),
+                     Phase = Landmark.Start)
+pointing.data <- read_rds(file = "data/pointing_trial_meta_data.RDS") %>% 
+  group_by(File, ID, Name,Trial)%>%
+  summarise(Task = "Egocentric pointing",
+         Average_Pointing_Error = mean(Unsigned_Error),
+         Average_Pointing_Error_signed = mean(Signed_Error),
+         From_Landmark = unique(From_Landmark)[1])%>%
+  ungroup()%>%
+  distinct()
+training.data <- read_rds(file = "data/training_phases_meta_data.RDS") %>%
+  rename(`Total Duration`=Duration) %>% 
+  left_join(read_rds(file = "data/training_phase_one_meta_data.RDS") %>% 
+              mutate(Phase = "Rotation"), 
+            join_by(File,Name,ID, Phase) )%>% 
+  coalesce_join(read_rds(file = "data/training_phase_two_meta_data.RDS") %>% 
+              mutate(Phase = "Movement",
+                     Trial = paste(Trial))%>%
+                select(-Task), 
+            join_by(File,Name,ID, Phase) ,
+            keep = "left",
+            join = "left_join")%>% 
+  coalesce_join(read_rds(file = "data/training_phase_five_meta_data.RDS") %>% 
+              mutate(Phase = "HomingMultiLegs",
+                     Count = 3,
+                     Duration = Time) %>%
+                uncount(Count)%>%
+                mutate(
+                     Trial = paste0("T",as.character(Trial),".L",c("1","2","3")))%>%
+                select(-Time) , 
+            join_by(File,Name,ID, Phase) ,
+            keep = "left",
+            join = "left_join")  %>% 
+  mutate(Task = "Training")
+
+space.data <- mapping.data %>%
+  full_join(memory.data%>% 
+              rename("totalTime"="TotalTime"), 
+            by = join_by(File, Name, ID,StartTime,EndTime,Task,totalTime)) %>%
+  full_join(path.integration.data %>% rename("totalTime"="Time")%>%
+              mutate(Trial = as.character(Trial),
+                     Phase = "Movement"), 
+            by = join_by(File, Name, ID, Task,totalTime)) %>%
+  full_join(perspective.taking.data %>% 
+              rename("totalTime"="TotalTime") , 
+            by = join_by(File, Name, ID, Phase, StartTime, EndTime, Task, totalTime, Trial)) %>%
+  full_join(pointing.data %>%
+              mutate(Trial = as.character(Trial),
+                     Phase = "Pointing"), 
+            by = join_by(File, Name, ID, Task, Trial, Phase)) %>% 
+  full_join(training.data%>%
+              rename("totalTime"="Duration")%>%
+              mutate(Trial = as.character(Trial)),
+            by = join_by(File, Name, ID, Task, Trial, Phase, Distance, PIDistance, PIRatio, PIDistanceError, PIAngle, PIAngleError, FinalX,
+FinalY, Landmark1, Landmark2, TimeRocketLandmark1, TimeLandmark1Landmark2, TimeLandmark2Rocket, DistanceRocketLandmark1,
+DistanceLandmark1Landmark2, DistanceLandmark2Rocket,totalTime))%>%
+  mutate(Name = as.numeric(Name),
+         Name = case_when(Name == 32~326,T~Name))
+```
+
+### Merge data
+
+```{r}
+all.data <- bind_rows(
+  eye.tracking.data %>% 
+    filter((Task=="Mapping" & Name != 282) |
+             (Task == "Memory" & !(Name == 282 | Name == 303))) %>%
+    group_by(Name,Task) %>% 
+    mutate(StartTime = min(StartTime,na.rm = T),
+           EndTime = max(EndTime,na.rm = T),
+           blink_count = sum(blink_count,na.rm = T),
+           average_blink_duration = sum(average_blink_duration,na.rm = T)/n(),
+           max_blink_duration=max(max_blink_duration,na.rm = T),
+           saccadic_count = sum(saccadic_count,na.rm=T),
+           average_saccadic_duration = sum(average_saccadic_duration,na.rm = T)/n(),
+           maximum_saccadic_duration = case_when(sum(average_saccadic_duration,na.rm = T)==0~-1,
+                                                 T~max(maximum_saccadic_duration,na.rm = T)),
+           fixation_count = sum(fixation_count,na.rm=T),
+           average_fixation_duration = sum(average_fixation_duration,na.rm = T)/n(),
+           maximum_fixation_duration = max(maximum_fixation_duration,na.rm = T),
+           gaze_entropy = max(gaze_entropy, na.rm = T),
+           L_slope = median(L_slope,na.rm = T),
+           L_max = max(L_max, na.rm = T),
+           L_mean = mean(L_mean, na.rm = T),
+           L_entropy = max(L_entropy, na.rm = T),
+           L_variation = max(L_variation, na.rm = T),
+           R_slope = median(R_slope,na.rm = T),
+           R_max = max(R_max, na.rm = T),
+           R_mean = mean(R_mean, na.rm = T),
+           R_variation = max(R_variation, na.rm = T),
+           R_entropy = max(R_entropy, na.rm = T),
+           Phase = NA_character_,
+           Trial = NA_character_,
+           Leg = NA_character_,
+           ) %>% 
+    distinct(),
+  eye.tracking.data %>% filter(Task!="Mapping" & Task!= "Memory"))%>%
+  left_join(demographics.data, join_by(Name==`Player_Name`)) %>%
+  left_join(moca.data %>%mutate(`Subject ID` = as.double(`Subject ID`)),  # Convert to double
+    join_by(Name == `Subject ID`)
+  ) %>%
+  coalesce_join(space.data %>% select(-StartTime,-EndTime), by = join_by(Name, Task, Phase, Trial),
+            keep = "left",
+            join = "left_join")
+```
+
+### Clean data
+
+```{r}
+clean.data <- all.data %>% ungroup() %>%
+  mutate(Interviewer = case_when(Interviewer_name=="Eunice"~1,
+                                 Interviewer_name=="Giorgio"~2,
+                                 Interviewer_name=="Karolina"~3,
+                                 Interviewer_name=="Sophia"~4,
+                                 T~-1),
+         Falls_number = case_when(is.na(Falls_number)~0,T~Falls_number),
+         Aid_strength_left = case_when(is.na(Aid_strength_left)~0,T~Aid_strength_left),
+         Aid_strength_right = case_when(is.na(Aid_strength_right)~0,T~Aid_strength_right),
+         isTransition = case_when(!str_detect(Task,">")&Phase=="Transition"~"Transition",
+                                  str_detect(Task,">")~"Transition",
+                                  T~"Task"),
+         Participant = as.factor(Name),
+         scaled_blink_count = as.numeric(scale(blink_count)),
+         scaled_MoCA = as.numeric(scale(MoCA)),
+         binary_MoCA = case_when(MoCA>25~"normal",
+                                 T~"impaired"),
+         StartTime = as_datetime(StartTime),
+         EndTime = as_datetime(EndTime),
+         Duration = as.duration(interval(StartTime,EndTime)),
+         ) %>% 
+  group_by(Name,Task) %>%
+  fill(Trial,Leg, .direction = "down") %>%
+  replace_na(list(Trial = "",Leg = ""))%>%
+  ungroup() %>%
+  mutate(Segment = str_trim(paste(Task,Phase,Trial,Leg,sep=" ")),
+         memory.sum = sum(Move.Duration.Egg+
+                                             Move.Duration.Fossil+
+                                             Move.Duration.Fruit+
+                                             Move.Duration.Gems+
+                                             Move.Duration.Rock+
+                                             Move.Duration.Water,na.rm = T),
+         PerformanceSum =case_when(
+           !is.na(Euc.R2)~1-Euc.R2,
+           !is.na(Move.Duration.Egg)~(memory.sum-min(memory.sum,na.rm=T) / (max(memory.sum,na.rm = T)-min(memory.sum,na.rm = T))),
+           !is.na(Calculated_Robot_Angle)~Calculated_Robot_Angle/180,
+           Task=="Training"&Phase=="Movement"~as.numeric(totalTime)/max(as.numeric(totalTime),na.rm = T),
+           isTransition=="Transition"~as.numeric(Duration)/max(as.numeric(Duration),na.rm = T),
+           Task=="Training"&Phase=="HomingMultiLegs"~(PIDistance/max(PIDistance,na.rm = T)+abs(PIAngleError)/180)/2,
+           Task=="Path Integration"&Phase=="Movement"~(PIDistance/max(PIDistance,na.rm = T)+abs(PIAngleError)/180)/2,
+           Task=="Egocentric pointing"&Phase=="Pointing"~Average_Pointing_Error/180,
+           Task=="Perspective Taking"&isTransition=="Task"~ErrorMeasure/180),
+         PerformanceLog =case_when(
+           !is.na(Euc.R2)~log(abs(Euc.R2)+1),
+           !is.na(Move.Duration.Egg)~log(Move.Duration.Egg+
+                                             Move.Duration.Fossil+
+                                             Move.Duration.Fruit+
+                                             Move.Duration.Gems+
+                                             Move.Duration.Rock+
+                                             Move.Duration.Water+1),
+           !is.na(Calculated_Robot_Angle)~log(Calculated_Robot_Angle+1),
+           Task=="Training"&Phase=="Movement"~log(as.numeric(totalTime)+1),
+           isTransition=="Transition"~log(as.numeric(Duration)+1),
+           Task=="Training"&Phase=="HomingMultiLegs"~log(abs(PIRatio)+1)+log(PIAngleError+1),
+           Task=="Path Integration"&Phase=="Movement"~log(abs(PIRatio)+1)+log(PIAngleError+1),
+           Task=="Egocentric pointing"&Phase=="Pointing"~log(abs(Average_Pointing_Error)+1),
+           Task=="Perspective Taking"&isTransition=="Task"~log(abs(ErrorMeasure)+1)),
+         Performance = -case_when(
+           !is.na(Euc.R2)~-scale(log(abs(Euc.R2)+1),center=F)[,1],
+           !is.na(Move.Duration.Egg)~scale(log(Move.Duration.Egg+
+                                             Move.Duration.Fossil+
+                                             Move.Duration.Fruit+
+                                             Move.Duration.Gems+
+                                             Move.Duration.Rock+
+                                             Move.Duration.Water+1),center=F)[,1],
+           !is.na(Calculated_Robot_Angle)~scale(log(abs(Calculated_Robot_Angle)+1),center=F)[,1],
+           Task=="Training"&Phase=="Movement"~scale(log(totalTime+1),center=F)[,1],
+           isTransition=="Transition"~scale(log(`Duration`+1))[,1],
+           Task=="Training"&Phase=="HomingMultiLegs"~scale(
+             scale(log(abs(PIRatio)+1),center=F)[,1]+
+               scale(log(abs(PIAngleError)+1),center=F)[,1])[,1],
+           Task=="Path Integration"&Phase=="Movement"~scale(
+             scale(log(abs(PIRatio)+1),center=F)[,1]+
+               scale(log(abs(PIAngleError)+1),center=F)[,1])[,1],
+           Task=="Egocentric pointing"&Phase=="Pointing"~scale(log(abs(Average_Pointing_Error)+1),center=F)[,1],
+           Task=="Perspective Taking"&isTransition=="Task"~scale(log(abs(ErrorMeasure)+1),center=F)[,1],
+           T~NA),
+         mean_blink_count = blink_count/as.numeric(Duration),
+         mean_fixation_count = fixation_count/as.numeric(Duration),
+         mean_saccadic_count = saccadic_count/as.numeric(Duration)
+         )%>%
+  select(Participant,
+         StartTime,
+         EndTime,
+         Duration,
+         Task,
+         Phase,
+         Segment,
+         isTransition,
+         Performance,
+         PerformanceLog,
+         PerformanceSum,
+         MoCA = `FINAL SCORE`,
+         scaled_MoCA,
+         binary_MoCA,
+         blink_count,
+         mean_blink_count,
+         scaled_blink_count,
+         average_blink_duration,
+         max_blink_duration,
+         saccadic_count,
+         mean_saccadic_count,
+         average_saccadic_duration,
+         maximum_saccadic_duration,
+         fixation_count,
+         mean_fixation_count,
+         average_fixation_duration,
+         maximum_fixation_duration,
+         gaze_entropy,
+         STE=ste,
+         GTE=gte,
+         BA,
+         L_slope,
+         L_mean,
+         L_max,
+         L_entropy,
+         L_variation,
+         R_slope,
+         R_mean,
+         R_max,
+         R_entropy,
+         R_variation,
+         Interviewer,
+         Age,
+         Age_Group,
+         Gender,
+         Gender_identity,
+         Educational_level,
+         Depression,
+         Anxiety,
+         Stress,
+         Falls_number,
+         Sleep,
+         Walking,
+         Physical_activity,
+         Handedness,
+         Snellen_left,
+         Snellen_right,
+         Visual_details,
+         Aid_strength_left,
+         Aid_strength_right
+         )
+```
+
+## Filter data
+
+```{r}
+filtered.data <- clean.data %>%  filter(if_all(c(Performance,PerformanceSum, mean_blink_count, average_blink_duration, max_blink_duration, saccadic_count, average_saccadic_duration, maximum_saccadic_duration, fixation_count, average_fixation_duration, maximum_fixation_duration, gaze_entropy, L_entropy, R_entropy,L_mean,R_mean,L_max,R_max, BA,STE,GTE, L_variation,R_variation,L_slope,R_slope,Age , Gender, Educational_level,
+         Depression,
+         Anxiety,
+         Stress,
+         Falls_number,
+         Sleep,
+         Walking,
+         Physical_activity,
+         Handedness),~!is.na(.))) %>% 
+  filter( isTransition!="Transition" & 
+            (Task == "Training" | 
+               Task == "Path Integration" | 
+               Task == "Egocentric pointing" | 
+               Task == "Perspective Taking")) %>% 
+  mutate(Task = factor(case_when(isTransition=="Transition"~"Transition",
+                                 T~Task),
+                       levels = c("Transition","Training",
+                                  "Path Integration","Egocentric pointing",
+                                  "Perspective Taking"))) %>% 
+  mutate(Task = gsub(" ", "_", Task),
+         Decades = Age/10,
+         Education = case_when(Educational_level == "No formal education"~0,
+                               Educational_level=="High school"~1,
+                               Educational_level=="University degree"~2,T~NA_real_),
+         DAS = Depression + Anxiety + Stress) %>%dummy_cols(select_columns = "Task") #%>% mutate_if(is.numeric, ~(scale(.) %>% as.vector))
+
+
+saveRDS(filtered.data,file="filtered.RDS")
+saveRDS(clean.data,file="clean.RDS")
+
+
+inter.data <- clean.data %>%  filter(if_all(c(Performance,PerformanceSum, mean_blink_count, average_blink_duration, max_blink_duration, saccadic_count, average_saccadic_duration, maximum_saccadic_duration, fixation_count, average_fixation_duration, maximum_fixation_duration, gaze_entropy, L_entropy, R_entropy,L_mean,R_mean,L_max,R_max, BA,STE,GTE, L_variation,R_variation,L_slope,R_slope,Age , Gender, Educational_level,
+         Depression,
+         Anxiety,
+         Stress,
+         Falls_number,
+         Sleep,
+         Walking,
+         Physical_activity,
+         Handedness),~!is.na(.))) %>% filter( isTransition=="Transition" )
+```

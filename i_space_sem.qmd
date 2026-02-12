@@ -1,0 +1,196 @@
+---
+title: "i_space"
+author: Jascha Grübel
+date: 2024-10-22
+---
+
+# iSPACE
+
+## Setup
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load("readxl","tidyverse","lme4","AER","nlme","lmerTest","randomForest","caret","robustbase","robustlmm","lavaan","semPlot","tidyr","broom","lavaanPlot","tidySEM","fastDummies","texreg","StanHeaders", "rstan","blavaan","remotes","corrplot") 
+
+if(Sys.info()["sysname"] == "Darwin"){#is on Mac
+  #remotes::install_github("coatless-mac/macrtools")
+  #macrtools::macos_rtools_install()
+} else {
+  warning("PLEASE INSTALL STAN FOR WINDOWS: Install RTools43 following the instructions here: https://cran.r-project.org/bin/windows/Rtools/rtools43/rtools.html")
+}
+
+```
+
+Functions
+
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+```
+
+### Load data
+
+```{r}
+filtered.data <- readRDS("filtered.RDS") 
+```
+
+### Correlation plots
+
+```{r}
+mydata.cor = cor(filtered.data %>% select_if(is.numeric))
+corrplot(mydata.cor,order = "hclust",diag=F,tl.cex = 0.5)
+```
+
+# LM
+
+```{r}
+
+lm.mod.eye.on.space<-lm(PerformanceLog ~Task + R_variation  +R_mean   +R_entropy+ 
+         mean_blink_count + average_blink_duration +
+         mean_saccadic_count + average_saccadic_duration  +
+         mean_fixation_count + average_fixation_duration  +
+         gaze_entropy + BA + STE + GTE + L_variation  +L_mean  +L_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress +
+                   Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+
+lm.mod.no.space<-lm(MoCA ~ Age + Gender + Educational_level + Depression + Anxiety + Stress  + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+
+
+lm.mod.no.eye<-lm(MoCA ~ PerformanceLog  + Age + Gender + Educational_level + Depression + Anxiety + Stress  + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+
+
+lm.mod.space.only<-lm(MoCA ~ PerformanceLog  ,data=filtered.data)
+
+
+lm.mod.eye.only<-lm(MoCA ~  R_variation  +R_mean   +R_entropy+ 
+         mean_blink_count + average_blink_duration +
+         mean_saccadic_count + average_saccadic_duration  +
+         mean_fixation_count + average_fixation_duration  +
+         gaze_entropy + BA + STE + GTE + L_variation  +L_mean  +L_entropy,data=filtered.data)
+
+
+lm.mod.no.space.but.eye<-lm(MoCA ~ R_variation  +R_mean   +R_entropy+ 
+         mean_blink_count + average_blink_duration +
+         mean_saccadic_count + average_saccadic_duration  +
+         mean_fixation_count + average_fixation_duration  +
+         gaze_entropy + BA + STE + GTE + L_variation  +L_mean  +L_entropy + Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+
+
+lm.mod<-lm(MoCA ~ PerformanceLog  +R_variation  +R_mean   +R_entropy+ 
+         mean_blink_count + average_blink_duration +
+         mean_saccadic_count + average_saccadic_duration  +
+         mean_fixation_count + average_fixation_duration  +
+         gaze_entropy + BA + STE + GTE + L_variation  +L_mean  +L_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness,data=filtered.data)
+
+texreg(list(lm.mod.eye.on.space,lm.mod.no.space,lm.mod.no.eye,lm.mod.space.only,lm.mod.no.space.but.eye,lm.mod))
+```
+
+# SEM
+
+```{r}
+# Define the SEM model
+model <- paste0('
+# Within cluster performance across tasks for 1 participant  
+level: 1
+    #Measured by
+    L1.SPACE=~ PerformanceLog 
+    #Regressed on
+    L1.SPACE ~ mean_blink_count + average_blink_duration + mean_saccadic_count + average_saccadic_duration + mean_fixation_count + average_fixation_duration +R_variation    +R_entropy + R_mean + gaze_entropy + STE + GTE + BA
+
+# Between Cognitive ability (MoCA) predicted by physiological + demographic factors
+  level: 2    
+    #Measured by
+    
+    L2 =~ MoCA
+    L1.SPACE =~PerformanceLog
+    #Regressed on
+    L2 ~  L1.SPACE + Age + Gender + Education + Depression + Anxiety + Stress  +
+                   Falls_number + Sleep + Walking + Physical_activity + Handedness + Snellen_left
+    L1.SPACE ~ mean_blink_count + average_blink_duration + mean_saccadic_count + average_saccadic_duration + mean_fixation_count + average_fixation_duration +R_variation    +R_entropy + R_mean + gaze_entropy + STE + GTE + BA
+    
+')
+
+
+# Fit the SEM
+fit <- sem(model, data = filtered.data, std.lv = TRUE, missing = "fiml",cluster = "Participant")#, ridge = T, estimator = "MLR")
+
+# Summarize results
+summary(fit, standardized = TRUE, fit.measures = TRUE, rsquare = TRUE)
+
+lavInspect(fit, "icc")
+
+lavInspect(fit, "h1")
+
+varTable(fit)
+
+lavaanPlot(fit)
+
+test_layout<-t(get_layout(fit))
+
+graph_sem(model = fit,
+          layout = test_layout,
+          rect_width = 0.2,
+          rect_height = 0.2,
+          text_size = 2)
+
+```
+
+```{r}
+# Extract parameter estimates
+pe <- parameterEstimates(fit, standardized = TRUE) %>%
+  filter(op == "~") %>%   # only regression paths
+  mutate(response = lhs, predictor = rhs)
+
+# Split by dependent variable
+moca_effects <- pe %>% filter(level==2)
+perf_effects <- pe %>% filter(level==1)
+
+# Plot for MoCA predictors
+ggplot(moca_effects, aes(x = reorder(predictor, std.all), y = std.all, fill = pvalue < 0.05)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Predictors of MoCA",
+       x = "Predictor", y = "Standardized Effect") +
+  scale_fill_manual(values = c("gray70", "steelblue"),
+                    labels = c("n.s.", "p < 0.05"),
+                    name = "Significance")
+
+# Plot for PerformanceSum predictors
+ggplot(perf_effects, aes(x = reorder(predictor, std.all), y = std.all, fill = pvalue < 0.05)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Predictors of Performance",
+       x = "Predictor", y = "Standardized Effect") +
+  scale_fill_manual(values = c("gray70", "darkgreen"),
+                    labels = c("n.s.", "p < 0.05"),
+                    name = "Significance")
+
+```
+
+# Random Forest
+
+```{r}
+seed=1351
+train_participants <- tibble(Participants=as.numeric(unique(as.character(clean.data$Participant)))) %>% slice_sample(prop=0.8) 
+train <- clean.data %>% na.omit()  %>% filter(Participant %in% train_participants$Participants)  %>% mutate(id=row_number(),MoCA=factor(binary_MoCA)) %>% select(-scaled_MoCA,-binary_MoCA)
+test <- clean.data %>% na.omit()  %>% filter(Participant %notin% train_participants$Participants) %>% mutate(id=row_number(),MoCA=factor(binary_MoCA)) %>% select(-scaled_MoCA,-binary_MoCA)
+rf <- randomForest(MoCA ~ PerformanceLog  +R_variation  +R_mean   +R_entropy+ 
+         mean_blink_count + average_blink_duration +
+         mean_saccadic_count + average_saccadic_duration  +
+         mean_fixation_count + average_fixation_duration  +
+         gaze_entropy + BA + STE + GTE + L_variation  +L_mean  +L_entropy+ Age + Gender + Educational_level + Depression + Anxiety + Stress + Falls_number + Sleep + Walking + Physical_activity + Handedness, ntree = 1000, data=train, proximity=FALSE)
+rf
+p1 <- predict(rf, train)
+confusionMatrix(p1, train$MoCA)
+```
+
+```{r}
+
+p1 <- predict(rf, test)
+confusionMatrix(p1, test$MoCA)
+```
+
+```{r}
+rf$importance
+```

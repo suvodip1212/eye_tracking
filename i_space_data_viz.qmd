@@ -1,0 +1,133 @@
+---
+title: "i_space"
+author: Jascha Grübel
+date: 2024-10-22
+---
+
+# iSPACE
+
+## Setup
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load("readxl","tidyverse","lme4","AER","nlme","lmerTest","randomForest","caret","robustbase","robustlmm","lavaan","semPlot","tidyr","broom","lavaanPlot","tidySEM","fastDummies","texreg","StanHeaders", "rstan","blavaan","remotes","corrplot") 
+
+if(Sys.info()["sysname"] == "Darwin"){#is on Mac
+  #remotes::install_github("coatless-mac/macrtools")
+  #macrtools::macos_rtools_install()
+} else {
+  warning("PLEASE INSTALL STAN FOR WINDOWS: Install RTools43 following the instructions here: https://cran.r-project.org/bin/windows/Rtools/rtools43/rtools.html")
+}
+
+```
+
+Functions
+
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+```
+
+### Load data
+
+```{r}
+filtered.data <- readRDS("filtered.RDS") 
+clean.data <- readRDS("clean.RDS")
+```
+
+## Data descriptives
+
+```{r}
+clean.data %>% distinct(Participant,.keep_all = T) %>%
+  ggplot(aes(x=MoCA,y=Age))+
+  geom_point()+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% filter(isTransition=="Task") %>%
+  ggplot(aes(x=PerformanceSum))+
+  facet_wrap(~Task)+
+  geom_density()+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% 
+  ggplot(aes(x=PerformanceSum,y=PerformanceLog,color=MoCA))+
+  geom_point()+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% distinct(Participant,.keep_all = T) %>%
+  ggplot(aes(x=MoCA,fill=Gender,group=Gender))+
+  geom_bar(position="dodge")+
+  theme_minimal()
+```
+
+Blink count
+
+```{r figure.width=10, figure.height=10}
+clean.data %>% filter(isTransition=="Task" & Task != "Memory")%>%
+  group_by(Participant, Task)%>%
+  summarise(blink=mean(blink_count/as.numeric(Duration), rm.na = T),
+            Performance=mean(PerformanceSum),
+            MoCA)%>%
+  ggplot(aes(x=blink,y=Performance,color=Task))+ 
+  geom_point()+ 
+  facet_wrap(~MoCA)+
+  theme_minimal()
+```
+
+```{r figure.width=10, figure.height=10}
+clean.data %>% filter(isTransition=="Task" & Task != "Memory")%>%
+  group_by(Participant, Task)%>%
+  summarise(blink=mean(blink_count/as.numeric(Duration), rm.na = T),
+            PerformanceSum=mean(PerformanceSum),
+            MoCA)%>%
+  ggplot(aes(x=blink,y=PerformanceSum,color=Task))+ 
+  geom_point()+ 
+  facet_wrap(~MoCA)+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% filter(isTransition=="Task")%>%
+  group_by(Participant, Task)%>%
+  summarise(blink=mean(blink_count/as.numeric(Duration), rm.na = T),
+            Performance=mean(Performance),
+            MoCA)%>%
+  ggplot(aes(x=blink,y=Performance,color=MoCA))+ 
+  geom_point()+ 
+  facet_wrap(~Participant)+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% filter(isTransition=="Task")%>%
+  group_by(Participant, Task)%>%
+  summarise(blink=mean(blink_count/as.numeric(Duration), rm.na = T),
+            PerformanceSum=mean(PerformanceSum),
+            MoCA)%>%
+  ggplot(aes(x=blink,y=PerformanceSum,color=MoCA))+ 
+  geom_point()+ 
+  facet_wrap(~Participant)+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% filter(isTransition=="Task") %>%
+  ggplot(aes(x=MoCA,y=blink_count, color=Participant))+ 
+  geom_point()+ 
+  facet_wrap(~Task)+
+  theme_minimal()
+```
+
+```{r}
+clean.data %>% filter(isTransition=="Task") %>%
+  ggplot(aes(x=binary_MoCA,y=blink_count, color=Participant))+ 
+  geom_point()+ 
+  facet_wrap(~Task)+
+  theme_minimal()
+```
