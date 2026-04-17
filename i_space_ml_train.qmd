@@ -13,7 +13,7 @@ date: 2024-10-22
 ```{r eval=F}
 install.packages('remotes')
 remotes::install_github("curso-r/treesnip@catboost",force=T)
-remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.8/catboost-R-darwin-universal2-1.2.8.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load", "--no-staged-install"))
+remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.10/catboost-R-windows-x86_64-1.2.10.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load", "--no-staged-install"))
 ```
 
 ## Packages
