@@ -19,6 +19,7 @@ remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.
 ## Packages
 
 ```{r}
+library(caret)
 if (!require("pacman")) install.packages("pacman")
 pacman::p_load(
   #workflow
@@ -183,17 +184,17 @@ reduced.data <- clean.data %>%
 mydata.cor = cor(reduced.data %>% select_if(is.numeric))
 corrplot::corrplot(mydata.cor,order = "hclust",diag=T,tl.cex = 0.75)
 
-ggpairs(clean.data %>% select(-participant,-task), aes(colour = task, alpha = 0.4))
+#ggpairs(clean.data %>% select(-participant,-task), aes(colour = task, alpha = 0.4))
 
-clean.data %>%
-    #select(- name) %>%
-    mixed_assoc() %>%
-    select(x, y, assoc) %>%
-    spread(y, assoc) %>%
-    column_to_rownames("x") %>%
-    as.matrix %>%
-    as_cordf %>%
-    network_plot()
+# clean.data %>%
+#     #select(- name) %>%
+#     mixed_assoc() %>%
+#     select(x, y, assoc) %>%
+#     spread(y, assoc) %>%
+#     column_to_rownames("x") %>%
+#     as.matrix %>%
+#     as_cordf %>%
+#     network_plot()
 
 ```
 
@@ -267,6 +268,21 @@ clean.recipe <-
     # prep the recipe so it can be used on other data
     prep()
 ```
+
+```{r}
+
+control <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+
+results <- rfe(
+  x = train_processed[, -1],
+  y = train_processed$target,
+  sizes = c(10, 20, 30),
+  rfeControl = control
+)
+
+selected_features <- predictors(results)
+```
+
 
 ### Cross-validation folds
 
@@ -510,6 +526,26 @@ xgboost_score_train <-
 
 knitr::kable(xgboost_score_train)
 ```
+Lets Plot the feature importances now.
+
+```{r}
+# Fit final model (store it explicitly)
+# Extract underlying xgboost model
+
+final_fit <- xgboost_model_final %>%
+  fit(formula = model.formula, data = train_processed)
+
+# 2. Extract the underlying engine and plot importance
+final_fit %>%
+  extract_fit_engine() %>%
+  vip(
+    num_features = 10,          # Adjust based on your preference
+    geom = "col",             # Can also use "col" for bars
+    aesthetics = list(color = "steelblue", size = 3)
+  ) +
+  labs(title = "XGBoost Feature Importance (Tuned Model)") +
+  theme_minimal()
+```
 
 ## LightGBM
 
@@ -552,6 +588,33 @@ lgbm_best_params <-
 lgbm_model_final <- 
   lightgbm_model%>% 
   finalize_model(lgbm_best_params)
+```
+
+```{r}
+# Fit final model
+lgbm_fit <- lgbm_model_final %>%
+  fit(
+    formula = model.formula,
+    data    = train_processed
+  )
+
+# Extract engine
+lgbm_engine <- lgbm_fit$fit
+
+# Feature importance
+library(lightgbm)
+
+importance_matrix <- lightgbm::lgb.importance(lgbm_engine)
+
+# Table
+importance_tbl <- importance_matrix %>%
+  as_tibble() %>%
+  dplyr::arrange(desc(Gain))
+
+knitr::kable(importance_tbl)
+
+# Plot
+lightgbm::lgb.plot.importance(importance_matrix)
 ```
 
 # Test
