@@ -13,7 +13,7 @@ date: 2024-10-22
 ```{r eval=F}
 install.packages('remotes')
 remotes::install_github("curso-r/treesnip@catboost",force=T)
-remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.10/catboost-R-windows-x86_64-1.2.10.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load", "--no-staged-install"))
+remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.10/catboost-R-Windows-1.2.10.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load", "--no-staged-install"))
 ```
 
 ## Packages
@@ -271,16 +271,380 @@ clean.recipe <-
 
 ```{r}
 
-control <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+# 1. Install and load Boruta
+if (!require("Boruta")) install.packages("Boruta")
+library(Boruta)
 
-results <- rfe(
-  x = train_processed[, -1],
-  y = train_processed$target,
-  sizes = c(10, 20, 30),
-  rfeControl = control
+# 2. Prepare data (Boruta needs a clean data frame with no NAs)
+# We use the same 'train_processed' we created for XGBoost
+feature_selection <- bake(prep(filtered.recipe), new_data = training(filtered.split)) %>%
+  select(-participant) # Remove ID column
+
+# 3. Run Boruta
+# We use 'doTrace = 2' so you can see the progress in the console
+set.seed(1234)
+boruta_output <- Boruta(mo_ca ~ ., data = feature_selection, doTrace = 2)
+
+# 4. Finalize the selection
+# Sometimes Boruta is 'Tentative' on some variables; this resolves them
+final_boruta <- TentativeRoughFix(boruta_output)
+
+# 5. Extract the confirmed "Important" features
+boruta_features <- getSelectedAttributes(final_boruta, withTentative = F)
+
+print(boruta_features)
+plot(final_boruta, las = 2, cex.axis = 0.7, main = "Boruta Feature Importance")
+
+# Define confirmed Boruta features (based on previous step)
+boruta_features <- getSelectedAttributes(final_boruta, withTentative =
+FALSE)
+# Create the dynamic formula
+boruta_formula <- as.formula(
+paste("mo_ca ~", paste(boruta_features, collapse = " + "))
+)
+```
+### CV Tools and checks for feature importance
+```{r}
+library(vip)
+reduced.cv.folds <- 
+    recipes::bake(
+        reduced.recipe, 
+        new_data = training(reduced.split)
+    ) %>%  
+    rsample::group_vfold_cv(group=participant, v = 5)
+
+filtered.cv.folds <- 
+    recipes::bake(
+        filtered.recipe, 
+        new_data = training(filtered.split)
+    ) %>%  
+    rsample::group_vfold_cv(group=participant, v = 5)
+
+clean.cv.folds <- 
+    recipes::bake(
+        clean.recipe, 
+        new_data = training(clean.split)
+    ) %>%  
+    rsample::group_vfold_cv(group=participant, v = 5)
+# --- Catboost Specs ---
+catboost_model <- 
+    parsnip::boost_tree(
+        mode = "regression",
+        trees = tune(),
+        min_n = 5,
+        learn_rate = tune(),
+        tree_depth = tune()
+    ) %>%
+    set_engine("catboost", loss_function = "RMSE")
+
+catboost_params <- dials::parameters(
+    trees(range = c(50,500)),
+    tree_depth(range = c(4,10)), 
+    learn_rate() 
+)
+catboost.grid <- dials::grid_space_filling(catboost_params, size = 20)
+
+catboost.workflow <- workflows::workflow() %>% add_model(catboost_model) %>% add_formula(mo_ca ~ .)
+catboost_boruta_wf <- workflows::workflow() %>% add_model(catboost_model) %>% add_formula(boruta_formula)
+
+
+# --- XGBoost Specs ---
+xgboost_model <- parsnip::boost_tree(
+    mode = "regression", trees = 1500, min_n = tune(),
+    tree_depth = tune(), learn_rate = tune(), loss_reduction = tune()
+  ) %>%
+    set_engine("xgboost", objective = "reg:squarederror")
+
+xgboost_params <- dials::parameters(min_n(), tree_depth(), learn_rate(), loss_reduction())
+xgboost_grid <- dials::grid_space_filling(xgboost_params, size = 60)
+
+xgboost_wf <- workflows::workflow() %>% add_model(xgboost_model) %>% add_formula(mo_ca ~ .) 
+xgboost_boruta_wf <- workflows::workflow() %>% add_model(xgboost_model) %>% add_formula(boruta_formula)
+
+
+# --- LightGBM Specs ---
+lightgbm_model <- parsnip::boost_tree(
+        mode = "regression", trees = 1000, min_n = tune(), tree_depth = tune()
+    ) %>%
+    set_engine("lightgbm", objective = "regression", verbose = -1)
+
+lightgbm_params <- dials::parameters(min_n(), tree_depth())
+lgbm_grid <- dials::grid_space_filling(lightgbm_params, size = 30)
+
+lgbm_wf <- workflows::workflow() %>% add_model(lightgbm_model) %>% add_formula(mo_ca ~ .)
+lgbm_boruta_wf <- workflows::workflow() %>% add_model(lightgbm_model) %>% add_formula(boruta_formula)
+# 1. Tune Models
+filtered.catboost.tuned <- tune_grid(
+    object = catboost.workflow, resamples = filtered.cv.folds, grid = catboost.grid,
+    metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = TRUE)
+)
+boruta.catboost.tuned <- tune_grid(
+    object = catboost_boruta_wf, resamples = filtered.cv.folds, grid = catboost.grid,
+    metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = TRUE)
 )
 
-selected_features <- predictors(results)
+# 2. Finalize Workflows and Fit 
+filtered.train.processed <- bake(prep(filtered.recipe), new_data = training(filtered.split))
+
+cat_full_fit <- catboost.workflow %>% 
+  finalize_workflow(select_best(filtered.catboost.tuned, metric="rmse")) %>%
+  fit(data = filtered.train.processed)
+
+cat_boruta_fit <- catboost_boruta_wf %>% 
+  finalize_workflow(select_best(boruta.catboost.tuned, metric="rmse")) %>%
+  fit(data = filtered.train.processed)
+
+# 3. Save Models
+saveRDS(cat_full_fit, "catboost_full_model.rds")
+saveRDS(cat_boruta_fit, "catboost_boruta_model.rds")
+
+# 4. Feature Importance Comparison
+cb_engine_full <- extract_fit_engine(cat_full_fit)
+cb_engine_boruta <- extract_fit_engine(cat_boruta_fit)
+
+cb_imp_full <- tibble(
+  feature = cb_engine_full$feature_names,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_full)),
+  Model = "Full Model"
+)
+
+cb_imp_boruta <- tibble(
+  feature = cb_engine_boruta$feature_names,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_boruta)),
+  Model = "Boruta Model"
+)
+
+# 4. Feature Importance Comparison
+cb_engine_full <- extract_fit_engine(cat_full_fit)
+cb_engine_boruta <- extract_fit_engine(cat_boruta_fit)
+
+# Explicitly define the feature names since CatBoost doesn't store them in the engine
+# The full model uses all columns from the training set except the target variable
+features_full <- colnames(filtered.train.processed %>% select(-mo_ca))
+
+# The Boruta model uses exactly the variables saved in 'boruta_features'
+features_boruta <- boruta_features
+
+# Create the data frames using the explicit names
+cb_imp_full <- tibble(
+  feature = features_full,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_full)),
+  Model = "Full Model"
+)
+
+cb_imp_boruta <- tibble(
+  feature = features_boruta,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_boruta)),
+  Model = "Boruta Model"
+)
+
+# Plot
+bind_rows(cb_imp_full, cb_imp_boruta) %>%
+  group_by(Model) %>%
+  slice_max(importance, n = 10) %>%
+  ggplot(aes(x = reorder(feature, importance), y = importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Model, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Full Model" = "#3498db", "Boruta Model" = "#2ecc71")) +
+  labs(title = "CatBoost Feature Importance Comparison", x = NULL, y = "Importance Score")
+# 1. Tune Models
+xgboost_tuned <- tune_grid(
+  object = xgboost_wf, resamples = reduced.cv.folds, grid = xgboost_grid,
+  metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = TRUE)
+)
+xgboost_boruta_tuned <- tune_grid(
+  object = xgboost_boruta_wf, resamples = filtered.cv.folds, grid = xgboost_grid,
+  metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = TRUE)
+)
+
+# 2. Finalize Workflows and Fit 
+train_processed_reduced <- bake(prep(reduced.recipe), new_data = training(reduced.split))
+train_processed_filtered <- bake(prep(filtered.recipe), new_data = training(filtered.split))
+
+xgb_full_fit <- xgboost_wf %>% 
+  finalize_workflow(select_best(xgboost_tuned, metric="rmse")) %>%
+  fit(data = train_processed_reduced)
+
+xgb_boruta_fit <- xgboost_boruta_wf %>% 
+  finalize_workflow(select_best(xgboost_boruta_tuned, metric="rmse")) %>%
+  fit(data = train_processed_filtered)
+
+# 3. Save Models
+saveRDS(xgb_full_fit, "xgboost_full_model.rds")
+saveRDS(xgb_boruta_fit, "xgboost_boruta_model.rds")
+
+# 4. Feature Importance Comparison
+xgb_engine_full <- extract_fit_engine(xgb_full_fit)
+xgb_engine_boruta <- extract_fit_engine(xgb_boruta_fit)
+
+
+xgb_imp_full <- xgb.importance(model = xgb_engine_full) %>% 
+  as_tibble() %>% 
+  select(Variable = Feature, Importance = Gain) %>% 
+  mutate(Model = "Full Model")
+
+xgb_imp_boruta <- xgb.importance(model = xgb_engine_boruta) %>% 
+  as_tibble() %>% 
+  select(Variable = Feature, Importance = Gain) %>% 
+  mutate(Model = "Boruta Model")
+
+
+bind_rows(xgb_imp_full, xgb_imp_boruta) %>%
+  group_by(Model) %>%
+  slice_max(Importance, n = 10) %>%
+  ungroup() %>% 
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Model, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Full Model" = "#3498db", "Boruta Model" = "#2ecc71")) +
+  labs(title = "XGBoost Feature Importance Comparison", x = NULL, y = "Importance Score (Gain)")
+# 1. Tune Models
+lgbm_tuned <- tune_grid(
+    object = lgbm_wf, resamples = filtered.cv.folds, grid = lgbm_grid,
+    metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = TRUE)
+)
+lgbm_boruta_tuned <- tune_grid(
+    object = lgbm_boruta_wf, resamples = filtered.cv.folds, grid = lgbm_grid,
+    metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = TRUE)
+)
+
+# 2. Finalize Workflows and Fit 
+lgbm_full_fit <- lgbm_wf %>% 
+  finalize_workflow(select_best(lgbm_tuned, metric="rmse")) %>%
+  fit(data = train_processed_filtered)
+
+lgbm_boruta_fit <- lgbm_boruta_wf %>% 
+  finalize_workflow(select_best(lgbm_boruta_tuned, metric="rmse")) %>%
+  fit(data = train_processed_filtered)
+
+# 3. Save Models
+saveRDS(lgbm_full_fit, "lightgbm_full_model.rds")
+saveRDS(lgbm_boruta_fit, "lightgbm_boruta_model.rds")
+
+# 4. Feature Importance Comparison
+lgbm_engine_full <- extract_fit_engine(lgbm_full_fit)
+lgbm_engine_boruta <- extract_fit_engine(lgbm_boruta_fit)
+
+
+lgbm_imp_full <- lgb.importance(lgbm_engine_full) %>% 
+  as_tibble() %>% 
+  select(Variable = Feature, Importance = Gain) %>% 
+  mutate(Model = "Full Model")
+
+lgbm_imp_boruta <- lgb.importance(lgbm_engine_boruta) %>% 
+  as_tibble() %>% 
+  select(Variable = Feature, Importance = Gain) %>% 
+  mutate(Model = "Boruta Model")
+
+
+bind_rows(lgbm_imp_full, lgbm_imp_boruta) %>%
+  group_by(Model) %>%
+  slice_max(Importance, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Model, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Full Model" = "#3498db", "Boruta Model" = "#2ecc71")) +
+  labs(title = "LightGBM Feature Importance Comparison", x = NULL, y = "Importance Score (Gain)")
+# Process test sets matching the recipes used during training
+test_processed_filtered <- bake(prep(filtered.recipe), new_data = testing(filtered.split))
+test_processed_reduced  <- bake(prep(reduced.recipe), new_data = testing(reduced.split))
+
+# Generate predictions for all 6 finalized models
+preds_cat_full    <- predict(cat_full_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "CatBoost Full")
+preds_cat_boruta  <- predict(cat_boruta_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "CatBoost Boruta")
+preds_xgb_full    <- predict(xgb_full_fit, test_processed_reduced) %>% bind_cols(testing(reduced.split)) %>% mutate(model = "XGBoost Full")
+preds_xgb_boruta  <- predict(xgb_boruta_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "XGBoost Boruta")
+preds_lgbm_full   <- predict(lgbm_full_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "LightGBM Full")
+preds_lgbm_boruta <- predict(lgbm_boruta_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "LightGBM Boruta")
+
+# Combine all predictions
+all_predictions <- bind_rows(
+  preds_cat_full, preds_cat_boruta,
+  preds_xgb_full, preds_xgb_boruta,
+  preds_lgbm_full, preds_lgbm_boruta
+)
+
+# 1. Compare Test Accuracy Metrics (RMSE, RSQ, MAE)
+test_metrics <- all_predictions %>%
+  group_by(model) %>%
+  yardstick::metrics(truth = mo_ca, estimate = .pred) %>%
+  select(model, .metric, .estimate) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(rmse)
+
+knitr::kable(test_metrics, digits = 3, caption = "Final Test Set Metrics: Full vs Boruta Models")
+
+# 2. Residual Diagnostics Plotting
+all_predictions %>%
+  mutate(residual_pct = (mo_ca - .pred) / .pred) %>%
+  ggplot(aes(x = .pred, y = residual_pct, color = grepl("Boruta", model))) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~ model, scales = "free_x") +
+  scale_color_manual(values = c("TRUE" = "#2ecc71", "FALSE" = "#3498db")) +
+  theme_minimal() +
+  labs(
+    title = "Test Set Residual Diagnostics",
+    subtitle = "Comparing Full vs Boruta Features across Models",
+    x = "Predicted MoCa Score",
+    y = "Residual (%)"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme(legend.position = "none")
+# Process test sets matching the recipes used during training
+test_processed_filtered <- bake(prep(filtered.recipe), new_data = testing(filtered.split))
+test_processed_reduced  <- bake(prep(reduced.recipe), new_data = testing(reduced.split))
+
+# Generate predictions for all 6 finalized models
+preds_cat_full    <- predict(cat_full_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "CatBoost Full")
+preds_cat_boruta  <- predict(cat_boruta_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "CatBoost Boruta")
+preds_xgb_full    <- predict(xgb_full_fit, test_processed_reduced) %>% bind_cols(testing(reduced.split)) %>% mutate(model = "XGBoost Full")
+preds_xgb_boruta  <- predict(xgb_boruta_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "XGBoost Boruta")
+preds_lgbm_full   <- predict(lgbm_full_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "LightGBM Full")
+preds_lgbm_boruta <- predict(lgbm_boruta_fit, test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "LightGBM Boruta")
+
+# Combine all predictions
+all_predictions <- bind_rows(
+  preds_cat_full, preds_cat_boruta,
+  preds_xgb_full, preds_xgb_boruta,
+  preds_lgbm_full, preds_lgbm_boruta
+)
+
+# 1. Compare Test Accuracy Metrics (RMSE, RSQ, MAE)
+test_metrics <- all_predictions %>%
+  group_by(model) %>%
+  yardstick::metrics(truth = mo_ca, estimate = .pred) %>%
+  select(model, .metric, .estimate) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(rmse)
+
+knitr::kable(test_metrics, digits = 3, caption = "Final Test Set Metrics: Full vs Boruta Models")
+
+# 2. Residual Diagnostics Plotting
+all_predictions %>%
+  mutate(residual_pct = (mo_ca - .pred) / .pred) %>%
+  ggplot(aes(x = .pred, y = residual_pct, color = grepl("Boruta", model))) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~ model, scales = "free_x") +
+  scale_color_manual(values = c("TRUE" = "#2ecc71", "FALSE" = "#3498db")) +
+  theme_minimal() +
+  labs(
+    title = "Test Set Residual Diagnostics",
+    subtitle = "Comparing Full vs Boruta Features across Models",
+    x = "Predicted MoCa Score",
+    y = "Residual (%)"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme(legend.position = "none")
+
 ```
 
 
@@ -339,14 +703,16 @@ catboost.grid <-
     dials::grid_space_filling(
         catboost_params, 
         size = 20 # set this to a higher number to get better results
-        # I don't want to run this all night, so I set it to 30
     )
 
 catboost.workflow <- 
     workflows::workflow() %>%
-    add_model(catboost_model
-             ) %>% 
+    add_model(catboost_model) %>% 
     add_formula(mo_ca ~ .)
+
+catboost_boruta_wf <- workflows::workflow() %>%
+  add_model(catboost_model) %>%
+  add_formula(boruta_formula) # Boruta-only model
 ```
 
 ### XGBoost
@@ -380,7 +746,11 @@ xgboost_grid <-
 xgboost_wf <- 
   workflows::workflow() %>%
   add_model(xgboost_model) %>%
-  add_formula(model.formula)
+  add_formula(mo_ca ~ .) # Use filtered standard formula
+
+xgboost_boruta_wf <- workflows::workflow() %>%
+  add_model(xgboost_model) %>%
+  add_formula(boruta_formula) # Boruta-only model
 ```
 
 ### LightGBM
@@ -397,24 +767,25 @@ lightgbm_model<-
 
 lightgbm_params <- 
     dials::parameters(
-      # The parameters have sane defaults, but if you have some knowledge 
-      # of the process you can set upper and lower limits to these parameters.
-        min_n(), # 2nd important
-        tree_depth() # 3rd most important
+        min_n(), 
+        tree_depth() 
     )
 
 lgbm_grid <- 
     dials::grid_space_filling(
         lightgbm_params, 
-        size = 30 # set this to a higher number to get better results
-        # I don't want to run this all night, so I set it to 30
+        size = 30 
     )
 
 lgbm_wf <- 
     workflows::workflow() %>%
-    add_model(lightgbm_model
-             ) %>% 
+    add_model(lightgbm_model) %>% 
     add_formula(mo_ca ~ .)
+
+lgbm_boruta_wf <- workflows::workflow() %>%
+    add_model(lightgbm_model) %>% 
+    add_formula(boruta_formula) # Boruta-only model
+
 ```
 
 # Training
@@ -452,16 +823,30 @@ filtered.catboost.tuned %>%
   geom_point()+ 
   facet_wrap(~variable,scales = "free")+
   ggtitle("Best parameters for MAE")
+
+# Tune Boruta Model
+boruta.catboost.tuned <- tune::tune_grid(
+    object = catboost_boruta_wf,
+    resamples = filtered.cv.folds,
+    grid = catboost.grid,
+    metrics = yardstick::metric_set(rmse, rsq, mae),
+    control = tune::control_grid(verbose = T) 
+)
+
+
 ```
 
 ```{r}
 filtered.cbst.params <- 
   filtered.catboost.tuned %>%
     tune::select_best(metric="rmse")
+boruta.cbst.params <- tune::select_best(boruta.catboost.tuned, metric="rmse")
 
 filtered.cbst.model <- 
   catboost_model%>% 
   finalize_model(filtered.cbst.params)
+
+boruta.cbst.model <- finalize_model(catboost_model, boruta.cbst.params)
 ```
 
 ```{r eval=F}
@@ -483,6 +868,39 @@ train_prediction %>%
     yardstick::metrics(mo_ca, .pred) %>% 
   mutate(.estimate = format(round(.estimate, 2), big.mark = ",")) %>% 
   knitr::kable()
+```
+
+```{r}
+# Fit final model (store it explicitly)
+# Extract underlying catboost model
+
+# 1. Extract the raw engine
+cb_engine <- extract_fit_engine(trained.model.all.data)
+
+# 2. Get the importance scores
+# We use the column names from your 'filtered.train.processed' (minus the target)
+feature_names <- colnames(filtered.train.processed %>% select(-mo_ca))
+importance_values <- catboost.get_feature_importance(cb_engine)
+
+# 3. Combine into a clean table
+cb_imp_df <- tibble(
+  feature = feature_names,
+  importance = as.vector(importance_values)
+) %>%
+  arrange(desc(importance)) %>%
+  slice_max(importance, n = 10) # Keep top 10
+
+# 4. Create the Plot
+ggplot(cb_imp_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "#f39c12", color = "white") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "CatBoost Feature Importance",
+    subtitle = "Calculated via PredictionValuesChange",
+    x = NULL,
+    y = "Importance Score"
+  )
 ```
 
 ## XGBoost
@@ -525,6 +943,16 @@ xgboost_score_train <-
   mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
 
 knitr::kable(xgboost_score_train)
+# Tune Boruta Model
+xgboost_boruta_tuned <- tune::tune_grid(
+  object = xgboost_boruta_wf,
+  resamples = filtered.cv.folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+xgboost_boruta_best_params <- tune::select_best(xgboost_boruta_tuned, metric="rmse")
+xgboost_boruta_final <- finalize_model(xgboost_model, xgboost_boruta_best_params)
 ```
 Lets Plot the feature importances now.
 
@@ -588,6 +1016,16 @@ lgbm_best_params <-
 lgbm_model_final <- 
   lightgbm_model%>% 
   finalize_model(lgbm_best_params)
+# Tune Boruta Model
+lgbm_boruta_tuned <- tune::tune_grid(
+    object = lgbm_boruta_wf,
+    resamples = filtered.cv.folds,
+    grid = lgbm_grid,
+    metrics = yardstick::metric_set(rmse, rsq, mae),
+    control = tune::control_grid(verbose = T) 
+)
+lgbm_boruta_best_params <- tune::select_best(lgbm_boruta_tuned, metric = "rmse")
+lgbm_boruta_final <- finalize_model(lightgbm_model, lgbm_boruta_best_params)
 ```
 
 ```{r}
@@ -616,6 +1054,22 @@ knitr::kable(importance_tbl)
 # Plot
 lightgbm::lgb.plot.importance(importance_matrix)
 ```
+
+```{r}
+# Compare RMSE across all trained models
+comparison_results <- bind_rows(
+  show_best(filtered.catboost.tuned, metric = "rmse", n = 1) %>% mutate(model = "CatBoost Full"),
+  show_best(boruta.catboost.tuned, metric = "rmse", n = 1) %>% mutate(model = "CatBoost Boruta"),
+  show_best(xgboost_tuned, metric = "rmse", n = 1) %>% mutate(model = "XGBoost Full"),
+  show_best(xgboost_boruta_tuned, metric = "rmse", n = 1) %>% mutate(model = "XGBoost Boruta"),
+  show_best(lgbm_tuned, metric = "rmse", n = 1) %>% mutate(model = "LightGBM Full"),
+  show_best(lgbm_boruta_tuned, metric = "rmse", n = 1) %>% mutate(model = "LightGBM Boruta")
+) %>% select(model, mean, std_err) %>% arrange(mean)
+
+knitr::kable(comparison_results, caption = "Cross-Validation RMSE Comparison (Full vs. Boruta)")
+```
+
+
 
 # Test
 

@@ -7,7 +7,7 @@ All_Fixed_JSON_SPACEE/
 .RData
 .Ruserdata
 *.RData
-*.RDS
+
 # Ignore libary files
 i_space_files
 catboost_info
@@ -53,3 +53,4 @@ Tests_Data_Analysis/
 *.out
 *.csv~
 *.json~
+*.exe~
