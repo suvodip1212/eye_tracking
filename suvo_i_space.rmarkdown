@@ -1,0 +1,947 @@
+---
+title: "suvo_i_space"
+author: Suvodip Chakraborty
+date: 2026-08-04
+---
+
+# iSPACE
+
+# Setup
+
+## Dev-Packages
+
+```{r eval=F}
+install.packages('remotes')
+remotes::install_github("curso-r/treesnip@catboost",force=T)
+remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.10/catboost-R-Windows-1.2.10.tgz', INSTALL_opts = c("--no-multiarch", "--no-test-load", "--no-staged-install"))
+```
+
+## Packages
+
+```{r}
+library(caret)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  #workflow
+  tidyverse,caret,janitor,dplyr,rsample,recipes,parsnip,
+  tune,dials,workflows,yardstick,bonsai,doParallel,fastDummies,
+  #modelling
+  randomForest,catboost,xgboost,lightgbm,Boruta,
+  #Visualisation
+  ggplot2,kernelshap,corrr,rcompanion,GGally,
+  #SHAP
+  shapviz,SHAPforxgboost,
+  #SEM
+  lavaan,lavaanPlot,tidySEM)
+```
+
+## Settings
+
+```{r}
+# speed up computation with parallel processing
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+# set the random seed so we can reproduce any simulated results.
+set.seed(1234)
+```
+
+## Functions
+
+```{r}
+`%notin%` <- Negate(`%in%`)
+
+clean.labels <- function(x) {
+  x %>%
+    gsub("'", "", .) %>%
+    gsub("\"", "", .) %>%
+    gsub("%", "percent", .) %>%
+    gsub("^[ ]+", "", .) %>%
+    make.names(.) %>%
+    gsub("[.]+", "_", .) %>%
+    gsub("[_]+", "_", .) %>%
+    tolower(.) %>%
+    gsub("_$", "", .)
+}
+
+# Calculate a pairwise association between all variables in a data-frame. In particular nominal vs
+# nominal with Chi-square, numeric vs numeric with Pearson correlation, and nominal vs numeric with
+# ANOVA. Adopted from https://stackoverflow.com/a/52557631/590437
+mixed_assoc <- function(df, cor_method = "spearman", adjust_cramersv_bias = TRUE) {
+  df_comb <- expand.grid(names(df), names(df), stringsAsFactors = F) %>% set_names("X1", "X2")
+
+  is_nominal <- function(x) class(x) %in% c("factor", "character")
+  is_numeric <- function(x) { is.integer(x) || is_double(x) }
+
+  f <- function(xName, yName) {
+    x <- pull(df, xName)
+    y <- pull(df, yName)
+
+    result <- if (is_nominal(x) && is_nominal(y)) {
+      cv <- cramerV(as.character(x), as.character(y), bias.correct = adjust_cramersv_bias)
+      data.frame(xName, yName, assoc = cv, type = "cramersV")
+    } else if (is_numeric(x) && is_numeric(y)) {
+      correlation <- cor(x, y, method = cor_method, use = "complete.obs")
+      data.frame(xName, yName, assoc = correlation, type = "correlation")
+    } else if (is_numeric(x) && is_nominal(y)) {
+      r_squared <- summary(lm(x ~ y))$r.squared
+      data.frame(xName, yName, assoc = sqrt(r_squared), type = "anova")
+    } else if (is_nominal(x) && is_numeric(y)) {
+      r_squared <- summary(lm(y ~ x))$r.squared
+      data.frame(xName, yName, assoc = sqrt(r_squared), type = "anova")
+    } else {
+      warning(paste("unmatched column type combination: ", class(x), class(y)))
+    }
+
+    result %>%
+      mutate(complete_obs_pairs = sum(!is.na(x) & !is.na(y)),
+             complete_obs_ratio = complete_obs_pairs / length(x)) %>%
+      rename(x = xName, y = yName)
+  }
+
+  map2_df(df_comb$X1, df_comb$X2, f)
+}
+```
+
+## Data
+
+### Load data
+
+```{r}
+filtered.raw <- readRDS("filtered.RDS")
+
+# TODO convert Visual_details (col 58) into meaningful categories
+cols_to_use <- c(1,4,5,8,10,12,
+                  15,16,18:50,52:57,59,60)
+
+filtered.data <- filtered.raw %>%
+  select(all_of(cols_to_use)) %>%
+  mutate(education = case_when(Educational_level == "University degree" ~ 1, T ~ 0),
+         is_transition = case_when(isTransition == "Transition" ~ 1, T ~ 0),
+         task = case_when(str_detect(Task, ">") ~ "Waiting", T ~ Task),
+         male = case_when(Gender == "Male" ~ 1, T ~ 0),
+         right_handed = case_when(Handedness == "Right handed" ~ 1, T ~ 0),
+         task = clean.labels(task)) %>%
+  select(-Task, -Educational_level, -Gender, -Gender_identity, -Age_Group, -isTransition, -Handedness) %>%
+  janitor::clean_names() %>%
+  mutate_if(is.character, factor) %>%
+  filter(task == "training")
+
+clean.raw <- readRDS("clean.RDS")
+clean.data <- clean.raw %>%
+  select(all_of(cols_to_use)) %>%
+  mutate(education = case_when(Educational_level == "University degree" ~ 1, T ~ 0),
+         is_transition = case_when(isTransition == "Transition" ~ 1, T ~ 0),
+         task = case_when(str_detect(Task, ">") ~ "Waiting", T ~ Task),
+         male = case_when(Gender == "Male" ~ 1, T ~ 0),
+         right_handed = case_when(Handedness == "Right handed" ~ 1, T ~ 0),
+         task = clean.labels(task)) %>%
+  select(-Task, -Educational_level, -Gender, -Gender_identity, -Age_Group, -isTransition, -Handedness) %>%
+  janitor::clean_names() %>%
+  mutate_if(is.character, factor) %>%
+  filter(task == "training") %>%
+  na.omit()
+```
+
+### Data inspection
+
+```{r}
+mydata.cor <- cor(clean.data %>% select_if(is.numeric))
+corrplot::corrplot(mydata.cor, order = "hclust", diag = T, tl.cex = 0.75)
+
+reduced.data <- clean.data %>%
+  select(
+    # Correlated with average duration
+    -maximum_fixation_duration, -maximum_saccadic_duration, -max_blink_duration,
+    # Snellen right correlated with left but left has less correlation with age
+    -snellen_right,
+    # Walking and physical are similar
+    -walking,
+    # L/R mean/Max highly correlated, use l_mean with lowest correlation to other variables
+    -r_max, -r_mean, -l_max,
+    # entropy, GTE; STE somewhat correlated but GTE/STE has same correlation structure
+    -ste,
+    # mean saccadic/fixation count highly correlated, use fixations
+    -mean_saccadic_count,
+    # counts correlated strongly with duration, only keep time
+    -blink_count, -saccadic_count, -fixation_count,
+    # L/R entropy/variation is highly correlated, use r_variation because is most different
+    -l_entropy, -r_entropy, -l_variation,
+    # aid strength l/r highly correlated, keep left as snellen kept right
+    -aid_strength_left,
+    # depression, anxiety, stress are highly correlated, keep depression for correlation with others
+    -anxiety, -stress
+  )
+
+mydata.cor <- cor(reduced.data %>% select_if(is.numeric))
+corrplot::corrplot(mydata.cor, order = "hclust", diag = T, tl.cex = 0.75)
+```
+
+### Split data
+
+```{r}
+reduced.split <- rsample::group_initial_split(
+  reduced.data,
+  group = participant,
+  prop = 0.7,
+  strata = mo_ca
+)
+
+filtered.split <- rsample::group_initial_split(
+  filtered.data,
+  group = participant,
+  prop = 0.8,
+  strata = mo_ca
+)
+
+clean.split <- rsample::group_initial_split(
+  clean.data,
+  group = participant,
+  prop = 0.8,
+  strata = mo_ca
+)
+```
+
+## Recipes
+
+```{r}
+reduced.recipe <-
+  recipes::recipe(mo_ca ~ ., data = training(reduced.split)) %>%
+  update_role(participant, new_role = "id") %>%
+  recipes::step_string2factor(all_nominal()) %>%
+  recipes::step_other(all_nominal(), threshold = 0.001) %>%
+  recipes::step_nzv(all_nominal()) %>%
+  prep()
+
+reduced.formula <- formula(reduced.recipe)
+
+filtered.recipe <-
+  recipes::recipe(mo_ca ~ ., data = training(filtered.split)) %>%
+  update_role(participant, new_role = "id") %>%
+  recipes::step_string2factor(all_nominal()) %>%
+  recipes::step_other(all_nominal(), threshold = 0.001) %>%
+  recipes::step_nzv(all_nominal()) %>%
+  prep()
+
+filtered.formula <- formula(filtered.recipe)
+
+clean.recipe <-
+  recipes::recipe(mo_ca ~ ., data = training(clean.split)) %>%
+  recipes::step_string2factor(all_nominal()) %>%
+  recipes::step_other(all_nominal(), threshold = 0.01) %>%
+  recipes::step_nzv(all_nominal()) %>%
+  prep()
+```
+
+> Note: `mo_ca` is used as the outcome consistently across all three recipes/splits (the previous
+> version mixed `performance_log` into the `reduced` recipe while everything downstream evaluated
+> against `mo_ca` — that mismatch has been removed).
+
+## Boruta feature selection
+
+Boruta is run on the `filtered` pipeline; the resulting feature set (`boruta_features` /
+`boruta_formula`) is what all "Boruta" model variants below are trained and tested on.
+
+```{r}
+feature_selection <- bake(filtered.recipe, new_data = training(filtered.split)) %>%
+  select(-participant) # Remove ID column
+
+# --- CHANGED: tighten Boruta's significance threshold (default pValue = 0.01) so it's harder
+# for a feature to be classified Confirmed, with more maxRuns so stricter thresholds still reach
+# a stable decision instead of leaving more features stuck Tentative.
+boruta_p_value <- 0.005
+boruta_max_runs <- 200
+
+boruta_output <- Boruta(mo_ca ~ ., data = feature_selection,
+                         pValue = boruta_p_value, maxRuns = boruta_max_runs, doTrace = 2)
+# --- END CHANGED
+
+# Resolve any 'Tentative' calls
+final_boruta <- TentativeRoughFix(boruta_output)
+
+table(final_boruta$finalDecision) # --- CHANGED: Confirmed/Rejected counts, to see the pValue effect
+
+plot(final_boruta, las = 2, cex.axis = 0.7, main = "Boruta Feature Importance (all tested)")
+
+# instead of keeping every Confirmed feature, rank them by importance and
+# keep only the top N. Adjust top_n_features to control how aggressive the cut is.
+top_n_features <- 15
+
+boruta_importance <- Boruta::attStats(final_boruta) %>%
+  tibble::rownames_to_column("feature") %>%
+  dplyr::filter(decision == "Confirmed") %>%
+  dplyr::arrange(dplyr::desc(medianImp))
+
+# --- CHANGED: keep every Confirmed feature, no top-N cut
+boruta_features <- boruta_importance %>%
+  dplyr::pull(feature)
+#  dplyr::slice_head(n = top_n_features) %>%
+#  
+
+print(boruta_features)
+
+boruta_formula <- as.formula(
+  paste("mo_ca ~", paste(boruta_features, collapse = " + "))
+)
+```
+
+## Cross-validation folds
+
+```{r}
+reduced.cv.folds <-
+  recipes::bake(reduced.recipe, new_data = training(reduced.split)) %>%
+  rsample::group_vfold_cv(group = participant, v = 5)
+
+filtered.cv.folds <-
+  recipes::bake(filtered.recipe, new_data = training(filtered.split)) %>%
+  rsample::group_vfold_cv(group = participant, v = 5)
+
+clean.cv.folds <-
+  recipes::bake(clean.recipe, new_data = training(clean.split)) %>%
+  rsample::group_vfold_cv(group = participant, v = 5)
+```
+
+## Model specs & workflows
+
+Each model gets three workflows:
+
+- **Full** — all features, `filtered.formula` (the `filtered` pipeline).
+- **Reduced** — `reduced.formula`, i.e. `reduced.data` after manually dropping highly-correlated
+  variables (see Data inspection above). This is the feature set we compare against the SEM below.
+- **Boruta** — `boruta_formula`, the Boruta-confirmed feature subset, always evaluated on the
+  `filtered` pipeline since that's where Boruta was run.
+
+### Catboost
+
+```{r}
+catboost_model <-
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = tune(),
+    min_n = 5,
+    learn_rate = tune(),
+    tree_depth = tune()
+  ) %>%
+  set_engine("catboost", loss_function = "RMSE")
+
+catboost_params <- dials::parameters(
+  trees(range = c(50, 500)),
+  tree_depth(range = c(4, 10)), # In most cases, optimal depth ranges 4-10; 6-10 recommended.
+  learn_rate()
+)
+
+catboost.grid <- dials::grid_space_filling(catboost_params, size = 20)
+
+catboost.workflow <-
+  workflows::workflow() %>%
+  add_model(catboost_model) %>%
+  add_formula(filtered.formula) # Full model, filtered pipeline
+
+catboost_reduced_wf <-
+  workflows::workflow() %>%
+  add_model(catboost_model) %>%
+  add_formula(reduced.formula) # Reduced model, correlation-reduced pipeline
+
+catboost_boruta_wf <-
+  workflows::workflow() %>%
+  add_model(catboost_model) %>%
+  add_formula(boruta_formula) # Boruta-only model
+```
+
+### XGBoost
+
+```{r}
+xgboost_model <-
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 1500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+  set_engine("xgboost", objective = "reg:squarederror")
+
+xgboost_params <- dials::parameters(min_n(), tree_depth(), learn_rate(), loss_reduction())
+xgboost_grid <- dials::grid_space_filling(xgboost_params, size = 60)
+
+xgboost_wf <-
+  workflows::workflow() %>%
+  add_model(xgboost_model) %>%
+  add_formula(filtered.formula) # Full model, filtered pipeline
+
+xgboost_reduced_wf <-
+  workflows::workflow() %>%
+  add_model(xgboost_model) %>%
+  add_formula(reduced.formula) # Reduced model, correlation-reduced pipeline
+
+xgboost_boruta_wf <-
+  workflows::workflow() %>%
+  add_model(xgboost_model) %>%
+  add_formula(boruta_formula) # Boruta-only model, filtered pipeline
+```
+
+### LightGBM
+
+```{r}
+lightgbm_model <-
+  parsnip::boost_tree(
+    mode = "regression",
+    trees = 1000,
+    min_n = tune(),
+    tree_depth = tune()
+  ) %>%
+  set_engine("lightgbm", objective = "regression", verbose = -1)
+
+lightgbm_params <- dials::parameters(min_n(), tree_depth())
+lgbm_grid <- dials::grid_space_filling(lightgbm_params, size = 30)
+
+lgbm_wf <-
+  workflows::workflow() %>%
+  add_model(lightgbm_model) %>%
+  add_formula(filtered.formula) # Full model, filtered pipeline
+
+lgbm_reduced_wf <-
+  workflows::workflow() %>%
+  add_model(lightgbm_model) %>%
+  add_formula(reduced.formula) # Reduced model, correlation-reduced pipeline
+
+lgbm_boruta_wf <-
+  workflows::workflow() %>%
+  add_model(lightgbm_model) %>%
+  add_formula(boruta_formula) # Boruta-only model
+```
+
+# Training
+
+All "Boruta" workflows are tuned against `filtered.cv.folds`, matching the pipeline the Boruta
+features were derived from. The XGBoost "Full" workflow is tuned against `reduced.cv.folds` as a
+separate baseline (kept from the original design); everything else uses `filtered.cv.folds`.
+
+## Catboost
+
+```{r}
+filtered.catboost.tuned <- tune::tune_grid(
+  object = catboost.workflow,
+  resamples = filtered.cv.folds,
+  grid = catboost.grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+reduced.catboost.tuned <- tune::tune_grid(
+  object = catboost_reduced_wf,
+  resamples = reduced.cv.folds,
+  grid = catboost.grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+boruta.catboost.tuned <- tune::tune_grid(
+  object = catboost_boruta_wf,
+  resamples = filtered.cv.folds,
+  grid = catboost.grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+filtered.catboost.tuned %>% tune::show_best(metric = "rmse", n = 5)
+
+filtered.catboost.tuned %>%
+  tune::show_best(metric = "rmse", n = 10) %>%
+  tidyr::pivot_longer(trees:learn_rate, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(value, mean)) +
+  geom_line(alpha = 1 / 2) +
+  geom_point() +
+  facet_wrap(~variable, scales = "free") +
+  ggtitle("CatBoost Full: best parameters for RMSE")
+```
+
+```{r}
+filtered.train.processed <- bake(filtered.recipe, new_data = training(filtered.split))
+reduced.train.processed  <- bake(reduced.recipe,  new_data = training(reduced.split))
+
+cat_full_fit <- catboost.workflow %>%
+  finalize_workflow(select_best(filtered.catboost.tuned, metric = "rmse")) %>%
+  fit(data = filtered.train.processed)
+
+cat_reduced_fit <- catboost_reduced_wf %>%
+  finalize_workflow(select_best(reduced.catboost.tuned, metric = "rmse")) %>%
+  fit(data = reduced.train.processed)
+
+cat_boruta_fit <- catboost_boruta_wf %>%
+  finalize_workflow(select_best(boruta.catboost.tuned, metric = "rmse")) %>%
+  fit(data = filtered.train.processed)
+
+saveRDS(cat_full_fit, "catboost_full_model.rds")
+saveRDS(cat_reduced_fit, "catboost_reduced_model.rds")
+saveRDS(cat_boruta_fit, "catboost_boruta_model.rds")
+```
+
+```{r}
+# Feature importance comparison: Full vs Reduced vs Boruta
+# NOTE: catboost.get_feature_importance() only returns scores for columns actually used as
+# predictors by the fitted formula — id-role columns like `participant` are excluded by the recipe's
+# formula even though they're still present in the baked data frame. Drop them here too, or the
+# name/score vectors won't line up (this is what caused the earlier tibble() size-mismatch error).
+cb_engine_full    <- extract_fit_engine(cat_full_fit)
+cb_engine_reduced <- extract_fit_engine(cat_reduced_fit)
+cb_engine_boruta  <- extract_fit_engine(cat_boruta_fit)
+
+features_full    <- colnames(filtered.train.processed %>% select(-mo_ca, -participant))
+features_reduced <- colnames(reduced.train.processed  %>% select(-mo_ca, -participant))
+features_boruta  <- boruta_features
+
+stopifnot(
+  "CatBoost Full: feature/importance length mismatch" =
+    length(features_full) == length(catboost.get_feature_importance(cb_engine_full)),
+  "CatBoost Reduced: feature/importance length mismatch" =
+    length(features_reduced) == length(catboost.get_feature_importance(cb_engine_reduced)),
+  "CatBoost Boruta: feature/importance length mismatch" =
+    length(features_boruta) == length(catboost.get_feature_importance(cb_engine_boruta))
+)
+
+cb_imp_full <- tibble(
+  feature = features_full,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_full)),
+  Model = "Full Model"
+)
+
+cb_imp_reduced <- tibble(
+  feature = features_reduced,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_reduced)),
+  Model = "Reduced Model"
+)
+
+cb_imp_boruta <- tibble(
+  feature = features_boruta,
+  importance = as.vector(catboost.get_feature_importance(cb_engine_boruta)),
+  Model = "Boruta Model"
+)
+
+bind_rows(cb_imp_full, cb_imp_reduced, cb_imp_boruta) %>%
+  group_by(Model) %>%
+  slice_max(importance, n = 10) %>%
+  ggplot(aes(x = reorder(feature, importance), y = importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Model, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Full Model" = "#3498db", "Reduced Model" = "#e67e22", "Boruta Model" = "#2ecc71")) +
+  labs(title = "CatBoost Feature Importance Comparison", x = NULL, y = "Importance Score")
+```
+
+## XGBoost
+
+```{r}
+train_processed_reduced  <- bake(reduced.recipe, new_data = training(reduced.split))
+train_processed_filtered <- bake(filtered.recipe, new_data = training(filtered.split))
+
+xgboost_tuned <- tune::tune_grid(
+  object = xgboost_wf,
+  resamples = filtered.cv.folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+xgboost_reduced_tuned <- tune::tune_grid(
+  object = xgboost_reduced_wf,
+  resamples = reduced.cv.folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+xgboost_boruta_tuned <- tune::tune_grid(
+  object = xgboost_boruta_wf,
+  resamples = filtered.cv.folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+xgboost_tuned %>% tune::show_best(metric = "rmse") %>% knitr::kable()
+
+xgb_full_fit <- xgboost_wf %>%
+  finalize_workflow(select_best(xgboost_tuned, metric = "rmse")) %>%
+  fit(data = train_processed_filtered)
+
+xgb_reduced_fit <- xgboost_reduced_wf %>%
+  finalize_workflow(select_best(xgboost_reduced_tuned, metric = "rmse")) %>%
+  fit(data = train_processed_reduced)
+
+xgb_boruta_fit <- xgboost_boruta_wf %>%
+  finalize_workflow(select_best(xgboost_boruta_tuned, metric = "rmse")) %>%
+  fit(data = train_processed_filtered)
+
+saveRDS(xgb_full_fit, "xgboost_full_model.rds")
+saveRDS(xgb_reduced_fit, "xgboost_reduced_model.rds")
+saveRDS(xgb_boruta_fit, "xgboost_boruta_model.rds")
+```
+
+```{r}
+xgb_engine_full    <- extract_fit_engine(xgb_full_fit)
+xgb_engine_reduced <- extract_fit_engine(xgb_reduced_fit)
+xgb_engine_boruta  <- extract_fit_engine(xgb_boruta_fit)
+
+xgb_imp_full <- xgb.importance(model = xgb_engine_full) %>%
+  as_tibble() %>%
+  select(Variable = Feature, Importance = Gain) %>%
+  mutate(Model = "Full Model")
+
+xgb_imp_reduced <- xgb.importance(model = xgb_engine_reduced) %>%
+  as_tibble() %>%
+  select(Variable = Feature, Importance = Gain) %>%
+  mutate(Model = "Reduced Model")
+
+xgb_imp_boruta <- xgb.importance(model = xgb_engine_boruta) %>%
+  as_tibble() %>%
+  select(Variable = Feature, Importance = Gain) %>%
+  mutate(Model = "Boruta Model")
+
+bind_rows(xgb_imp_full, xgb_imp_reduced, xgb_imp_boruta) %>%
+  group_by(Model) %>%
+  slice_max(Importance, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Model, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Full Model" = "#3498db", "Reduced Model" = "#e67e22", "Boruta Model" = "#2ecc71")) +
+  labs(title = "XGBoost Feature Importance Comparison", x = NULL, y = "Importance Score (Gain)")
+```
+
+## LightGBM
+
+```{r}
+lgbm_tuned <- tune::tune_grid(
+  object = lgbm_wf,
+  resamples = filtered.cv.folds,
+  grid = lgbm_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+lgbm_reduced_tuned <- tune::tune_grid(
+  object = lgbm_reduced_wf,
+  resamples = reduced.cv.folds,
+  grid = lgbm_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+lgbm_boruta_tuned <- tune::tune_grid(
+  object = lgbm_boruta_wf,
+  resamples = filtered.cv.folds,
+  grid = lgbm_grid,
+  metrics = yardstick::metric_set(rmse, rsq, mae),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+lgbm_tuned %>% tune::show_best(metric = "rmse", n = 5)
+
+lgbm_full_fit <- lgbm_wf %>%
+  finalize_workflow(select_best(lgbm_tuned, metric = "rmse")) %>%
+  fit(data = train_processed_filtered)
+
+lgbm_reduced_fit <- lgbm_reduced_wf %>%
+  finalize_workflow(select_best(lgbm_reduced_tuned, metric = "rmse")) %>%
+  fit(data = train_processed_reduced)
+
+lgbm_boruta_fit <- lgbm_boruta_wf %>%
+  finalize_workflow(select_best(lgbm_boruta_tuned, metric = "rmse")) %>%
+  fit(data = train_processed_filtered)
+
+saveRDS(lgbm_full_fit, "lightgbm_full_model.rds")
+saveRDS(lgbm_reduced_fit, "lightgbm_reduced_model.rds")
+saveRDS(lgbm_boruta_fit, "lightgbm_boruta_model.rds")
+```
+
+```{r}
+lgbm_engine_full    <- extract_fit_engine(lgbm_full_fit)
+lgbm_engine_reduced <- extract_fit_engine(lgbm_reduced_fit)
+lgbm_engine_boruta  <- extract_fit_engine(lgbm_boruta_fit)
+
+lgbm_imp_full <- lgb.importance(lgbm_engine_full) %>%
+  as_tibble() %>%
+  select(Variable = Feature, Importance = Gain) %>%
+  mutate(Model = "Full Model")
+
+lgbm_imp_reduced <- lgb.importance(lgbm_engine_reduced) %>%
+  as_tibble() %>%
+  select(Variable = Feature, Importance = Gain) %>%
+  mutate(Model = "Reduced Model")
+
+lgbm_imp_boruta <- lgb.importance(lgbm_engine_boruta) %>%
+  as_tibble() %>%
+  select(Variable = Feature, Importance = Gain) %>%
+  mutate(Model = "Boruta Model")
+
+bind_rows(lgbm_imp_full, lgbm_imp_reduced, lgbm_imp_boruta) %>%
+  group_by(Model) %>%
+  slice_max(Importance, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Model, scales = "free_y") +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("Full Model" = "#3498db", "Reduced Model" = "#e67e22", "Boruta Model" = "#2ecc71")) +
+  labs(title = "LightGBM Feature Importance Comparison", x = NULL, y = "Importance Score (Gain)")
+```
+
+## Cross-validation RMSE comparison
+
+```{r}
+comparison_results <- bind_rows(
+  show_best(filtered.catboost.tuned, metric = "rmse", n = 1) %>% mutate(model = "CatBoost Full"),
+  show_best(reduced.catboost.tuned,  metric = "rmse", n = 1) %>% mutate(model = "CatBoost Reduced"),
+  show_best(boruta.catboost.tuned,   metric = "rmse", n = 1) %>% mutate(model = "CatBoost Boruta"),
+  show_best(xgboost_tuned,           metric = "rmse", n = 1) %>% mutate(model = "XGBoost Full"),
+  show_best(xgboost_reduced_tuned,   metric = "rmse", n = 1) %>% mutate(model = "XGBoost Reduced"),
+  show_best(xgboost_boruta_tuned,    metric = "rmse", n = 1) %>% mutate(model = "XGBoost Boruta"),
+  show_best(lgbm_tuned,              metric = "rmse", n = 1) %>% mutate(model = "LightGBM Full"),
+  show_best(lgbm_reduced_tuned,      metric = "rmse", n = 1) %>% mutate(model = "LightGBM Reduced"),
+  show_best(lgbm_boruta_tuned,       metric = "rmse", n = 1) %>% mutate(model = "LightGBM Boruta")
+) %>%
+  select(model, mean, std_err) %>%
+  arrange(mean)
+
+knitr::kable(comparison_results, caption = "Cross-Validation RMSE Comparison (Full vs. Reduced vs. Boruta)")
+```
+
+# Test
+
+All models below are evaluated on their **held-out test sets**, using the finalized fits from the
+Training section above (`*_full_fit`, `*_reduced_fit`, `*_boruta_fit` for each of CatBoost, XGBoost,
+LightGBM) — not refit on training data again.
+
+```{r}
+test_processed_filtered <- bake(filtered.recipe, new_data = testing(filtered.split))
+test_processed_reduced  <- bake(reduced.recipe,  new_data = testing(reduced.split))
+
+preds_cat_full     <- predict(cat_full_fit,     test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "CatBoost Full")
+preds_cat_reduced  <- predict(cat_reduced_fit,  test_processed_reduced)  %>% bind_cols(testing(reduced.split))  %>% mutate(model = "CatBoost Reduced")
+preds_cat_boruta   <- predict(cat_boruta_fit,   test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "CatBoost Boruta")
+preds_xgb_full     <- predict(xgb_full_fit,     test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "XGBoost Full")
+preds_xgb_reduced  <- predict(xgb_reduced_fit,  test_processed_reduced)  %>% bind_cols(testing(reduced.split))  %>% mutate(model = "XGBoost Reduced")
+preds_xgb_boruta   <- predict(xgb_boruta_fit,   test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "XGBoost Boruta")
+preds_lgbm_full    <- predict(lgbm_full_fit,    test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "LightGBM Full")
+preds_lgbm_reduced <- predict(lgbm_reduced_fit, test_processed_reduced)  %>% bind_cols(testing(reduced.split))  %>% mutate(model = "LightGBM Reduced")
+preds_lgbm_boruta  <- predict(lgbm_boruta_fit,  test_processed_filtered) %>% bind_cols(testing(filtered.split)) %>% mutate(model = "LightGBM Boruta")
+
+all_predictions <- bind_rows(
+  preds_cat_full, preds_cat_reduced, preds_cat_boruta,
+  preds_xgb_full, preds_xgb_reduced, preds_xgb_boruta,
+  preds_lgbm_full, preds_lgbm_reduced, preds_lgbm_boruta
+)
+
+# Test-set accuracy metrics (RMSE, RSQ, MAE)
+test_metrics <- all_predictions %>%
+  group_by(model) %>%
+  yardstick::metrics(truth = mo_ca, estimate = .pred) %>%
+  select(model, .metric, .estimate) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(rmse)
+
+knitr::kable(test_metrics, digits = 3, caption = "Final Test Set Metrics: Full vs Reduced vs Boruta Models")
+
+# Residual diagnostics
+all_predictions %>%
+  mutate(residual_pct = (mo_ca - .pred) / .pred,
+         feature_set = case_when(
+           grepl("Boruta", model) ~ "Boruta",
+           grepl("Reduced", model) ~ "Reduced",
+           TRUE ~ "Full"
+         )) %>%
+  ggplot(aes(x = .pred, y = residual_pct, color = feature_set)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  facet_wrap(~model, scales = "free_x") +
+  scale_color_manual(values = c("Full" = "#3498db", "Reduced" = "#e67e22", "Boruta" = "#2ecc71")) +
+  theme_minimal() +
+  labs(
+    title = "Test Set Residual Diagnostics",
+    subtitle = "Comparing Full vs Reduced vs Boruta Features across Models",
+    x = "Predicted MoCa Score",
+    y = "Residual (%)",
+    color = "Feature set"
+  ) +
+  scale_y_continuous(labels = scales::percent)
+
+
+```
+
+# SHAP (Shapley Additive Explanations)
+
+Explaining the **Boruta-selected XGBoost model** (`xgb_boruta_fit`), since that's the model we
+actually care about interpreting — restricted to the Boruta feature set.
+
+```{r}
+X_explain <- testing(filtered.split)[, boruta_features]
+
+# 1.5 minutes on laptop
+# Note: if you have more than p=8 features, use kernelshap() instead of permshap()
+system.time(
+  shap_values <- xgb_boruta_fit |>
+    permshap(X = X_explain, feature_names = boruta_features, exact = FALSE) |>
+    shapviz()
+)
+
+saveRDS(shap_values, file = "shap_values.rds")
+shap_values <- readRDS("shap_values.rds")
+
+shap_values |> sv_importance("bee", max_display = 15, size = 0.5)
+shap_values |> sv_importance(kind = "both", show_numbers = TRUE)
+
+# Dependence plots for the top Boruta features (adjust to taste / to match your actual
+# boruta_features — this list must be a subset of boruta_features)
+dependence_vars <- intersect(
+  c("interviewer", "l_mean", "ba", "physical_activity", "sleep", "aid_strength_left"),
+  boruta_features
+)
+shap_values |> sv_dependence(dependence_vars, color_var = "auto")
+
+shap_values |> sv_force(row_id = 5)
+shap_values |> sv_waterfall(row_id = 40)
+```
+
+# SEM on full data (comparison to Reduced ML models)
+
+The tree ensembles above needed the manual correlation-based feature pruning (`reduced.data`)
+because highly collinear predictors hurt split-based models. A multilevel SEM handles that
+collinearity through its latent-variable structure instead, so here it's run on the **full**,
+un-pruned feature set — giving us a like-for-like comparison against the "Reduced" ML models above
+without needing to drop any variables by hand first.
+
+> **Important:** the model below uses raw column names (`PerformanceLog`, `MoCa`, `Gender`,
+> `R_variation`, `STE`, etc.) as they appear *before* the `janitor::clean_names()` step used
+> elsewhere in this script — because that step lowercases/renames everything and also drops some of
+> the demographic columns this model needs (`Gender`, `Handedness`, `Age`, `Educational_level`) in
+> favor of derived 0/1 dummies. `sem.data` below is built straight from `clean.raw` to preserve the
+> original names. **Double-check these names against your actual `clean.RDS` columns** — if any
+> don't match, adjust the `paste0()` string accordingly rather than the upstream data pipeline.
+
+```{r}
+# Full (un-reduced) feature set with original column names preserved, for SEM
+sem.data <- clean.raw %>%
+  select(all_of(cols_to_use)) %>%
+  filter(Task == "training")
+
+# --- Diagnostic: filter(Task == "training") is the most likely reason EVERY variable would get
+# flagged at once (n_non_na = 0 for all columns if this returns zero rows) — check that before
+# looking anywhere else.
+message("Distinct raw Task values (with counts):")
+print(table(clean.raw$Task, useNA = "always"))
+message("Rows in sem.data after filtering to Task == 'training': ", nrow(sem.data))
+
+if (nrow(sem.data) == 0) {
+  # Fall back to a case/whitespace-insensitive match instead of guessing the exact literal string
+  sem.data <- clean.raw %>%
+    select(all_of(cols_to_use)) %>%
+    filter(stringr::str_to_lower(stringr::str_trim(Task)) == "training")
+  message("Retried with case/whitespace-insensitive match — rows now: ", nrow(sem.data))
+}
+
+sem.data <- sem.data %>%
+  mutate(
+    Gender = case_when(Gender == "Male" ~ 1, TRUE ~ 0),
+    Handedness = case_when(Handedness == "Right handed" ~ 1, TRUE ~ 0)
+  )
+
+# --- Diagnostic: check every variable the SEM model actually uses BEFORE fitting, so a bad
+# column (constant, all-NA, still non-numeric, etc.) is reported clearly here instead of via
+# lavaan's generic "no finite variance" / "missing observed variables" errors.
+sem_vars <- c(
+  "Participant", "PerformanceLog", "MoCA",
+  "mean_blink_count", "average_blink_duration", "mean_saccadic_count", "average_saccadic_duration",
+  "mean_fixation_count", "average_fixation_duration", "R_variation", "R_entropy", "R_mean",
+  "gaze_entropy", "STE", "GTE", "BA",
+  "Age", "Gender", "Depression", "Anxiety", "Stress", "Sleep", "Walking",
+  "Physical_activity", "Handedness", "Snellen_left"
+)
+
+sem_var_diag <- purrr::map_dfr(sem_vars, function(v) {
+  if (!v %in% names(sem.data)) {
+    return(tibble(variable = v, present = FALSE, class = NA_character_,
+                   n_non_na = NA_integer_, n_distinct = NA_integer_, sd = NA_real_))
+  }
+  x <- sem.data[[v]]
+  tibble(
+    variable = v,
+    present = TRUE,
+    class = class(x)[1],
+    n_non_na = sum(!is.na(x)),
+    n_distinct = dplyr::n_distinct(x, na.rm = TRUE),
+    sd = if (is.numeric(x)) sd(x, na.rm = TRUE) else NA_real_
+  )
+})
+
+problem_vars <- sem_var_diag %>%
+  filter(!present | n_distinct <= 1 | n_non_na <= 1 | is.na(sd) | sd == 0 | class %in% c("character", "factor"))
+
+print(sem_var_diag, n = Inf)
+if (nrow(problem_vars) > 0) {
+  warning("SEM variables likely to break lavaan (constant / all-NA / non-numeric): ",
+          paste(problem_vars$variable, collapse = ", "))
+}
+# --- END CHANGED
+
+# Define the SEM model
+model <- paste0('
+# Within cluster performance across tasks for 1 participant
+level: 1
+    #Measured by
+    L1.SPACE =~ PerformanceLog
+    #Regressed on
+    L1.SPACE ~ mean_blink_count + average_blink_duration + mean_saccadic_count + average_saccadic_duration + mean_fixation_count + average_fixation_duration + R_variation + R_entropy + R_mean + gaze_entropy + STE + GTE + BA
+# Between Cognitive ability (MoCA) predicted by physiological + demographic factors
+level: 2
+    #Measured by
+    L2 =~ MoCA
+    L1.SPACE =~ PerformanceLog
+    #Regressed on
+    L2 ~  L1.SPACE + Age + Gender + Depression + Anxiety + Stress  + Sleep + Walking + Physical_activity + Handedness + Snellen_left
+    L1.SPACE ~ mean_blink_count + average_blink_duration + mean_saccadic_count + average_saccadic_duration + mean_fixation_count + average_fixation_duration + R_variation + R_entropy + R_mean + gaze_entropy + STE + GTE + BA
+')
+
+# Fit the SEM
+fit <- sem(model, data = sem.data, std.lv = TRUE, missing = "fiml", cluster = "Participant")
+
+# Summarize results
+summary(fit, standardized = TRUE, fit.measures = TRUE, rsquare = TRUE)
+lavInspect(fit, "icc")
+lavInspect(fit, "h1")
+varTable(fit)
+lavaanPlot(fit)
+
+test_layout <- t(get_layout(fit))
+graph_sem(
+  model = fit,
+  layout = test_layout,
+  rect_width = 0.2,
+  rect_height = 0.2,
+  text_size = 2
+)
+```
+
+## Inspectthe model
+
+```{r}
+lavInspect(fit, "converged")
+lavInspect(fit, "post.check")          # flags Heywood cases / negative variances
+summary(fit, fit.measures = TRUE)      # look for warnings printed above the table
+fitmeasures(fit, c("cfi", "tli", "rmsea", "srmr"))
+semPlot::semPaths(fit, what = "std", layout = "tree",
+                   whatLabels = "std", edge.label.cex = 0.6,
+                   rotation = 2, nCharNodes = 0)
+```
+
+Note these aren't directly comparable numbers — the ML "Reduced" models predict `mo_ca` in a single
+step from a feature-pruned set, while the SEM decomposes variance across two nested levels
+(within-participant `PerformanceLog` and between-participant `MoCa`) using the full feature set. The
+tables above are meant to be read side by side rather than merged into one ranking: the SEM's `MoCa`
+R\u00b2 is the more apples-to-apples number against the Reduced ML models' `rsq`.
+

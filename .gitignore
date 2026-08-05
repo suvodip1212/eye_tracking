@@ -54,3 +54,5 @@ Tests_Data_Analysis/
 *.csv~
 *.json~
 *.exe~
+
+/.quarto/
