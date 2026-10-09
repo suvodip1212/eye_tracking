@@ -1,8 +1,3 @@
----
-title: "suvo_i_space"
-author: Suvodip Chakraborty
-date: 2026-08-04
----
 
 # iSPACE
 
@@ -249,7 +244,7 @@ feature_selection <- bake(filtered.recipe, new_data = training(filtered.split)) 
 # --- CHANGED: tighten Boruta's significance threshold (default pValue = 0.01) so it's harder
 # for a feature to be classified Confirmed, with more maxRuns so stricter thresholds still reach
 # a stable decision instead of leaving more features stuck Tentative.
-boruta_p_value <- 0.005
+boruta_p_value <- 0.0001
 boruta_max_runs <- 200
 
 boruta_output <- Boruta(mo_ca ~ ., data = feature_selection,
@@ -926,14 +921,146 @@ graph_sem(
   text_size = 2
 )
 ```
+#Using boruta in sem
+```{r}
+# Make sure Gender/Handedness are recoded to numeric first (as in your old code)
 
-## Inspectthe model
+within_preds <- c("mean_blink_count", "average_blink_duration", "mean_saccadic_count",
+                  "average_saccadic_duration", "mean_fixation_count", "average_fixation_duration",
+                  "R_variation", "R_entropy", "R_mean", "gaze_entropy", "STE", "GTE", "BA")
+demog <- c("Age", "Gender", "Depression", "Anxiety", "Stress", "Sleep",
+           "Walking", "Physical_activity", "Handedness", "Snellen_left")
+
+# --- WITHIN level: person-centered trial data, outcome = PerformanceLog
+within_df <- sem.data %>%
+  select(Participant, PerformanceLog, all_of(within_preds)) %>%
+  group_by(Participant) %>%
+  mutate(across(c(PerformanceLog, all_of(within_preds)), ~ .x - mean(.x, na.rm = TRUE))) %>%
+  ungroup() %>%
+  select(-Participant) %>%
+  na.omit()
+
+set.seed(42)
+b_within <- Boruta(PerformanceLog ~ ., data = within_df, maxRuns = 200)
+b_within <- TentativeRoughFix(b_within)
+sel_within <- getSelectedAttributes(b_within)
+print(sel_within)
+
+# --- BETWEEN level: one row per participant, outcome = MoCA
+between_df <- sem.data %>%
+  group_by(Participant) %>%
+  summarise(across(c(MoCA, PerformanceLog, all_of(within_preds), all_of(demog)),
+                   ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  select(-Participant) %>%
+  na.omit()
+
+nrow(between_df)   # if this is small (<60), Boruta will be unstable at this level
+
+set.seed(42)
+b_between <- Boruta(MoCA ~ ., data = between_df, maxRuns = 200)
+b_between <- TentativeRoughFix(b_between)
+sel_between <- getSelectedAttributes(b_between)
+print(sel_between)
+
+plot(b_within, las = 2, cex.axis = 0.7)
+plot(b_between, las = 2, cex.axis = 0.7)
+
+# --- Selected features, minus saccade count (collinear with fixation count)
+drop_var     <- "mean_saccadic_count"
+w_keep       <- setdiff(intersect(sel_within, within_preds), drop_var)
+b_keep_phys  <- setdiff(intersect(sel_between, within_preds), drop_var)
+b_keep_demog <- intersect(sel_between, demog)
+
+# Safety checks: the direct path needs fixation count to have been selected
+print(w_keep); print(b_keep_phys); print(b_keep_demog)
+stopifnot("mean_fixation_count" %in% b_keep_phys)
+
+# Builds "lhs ~ a + b" only if there are predictors (avoids a dangling "~")
+rhs <- function(lhs, vars) {
+  if (length(vars) == 0) return("")
+  paste0("    ", lhs, " ~ ", paste(vars, collapse = " + "))
+}
+
+# --- FINAL MODEL: two-level path model with a direct fixation count -> MoCA path
+final_model <- paste0('
+level: 1
+    L1.SPACE =~ PerformanceLog
+    PerformanceLog ~~ 0*PerformanceLog
+', rhs("L1.SPACE", w_keep), '
+
+level: 2
+    L2 =~ MoCA
+    MoCA ~~ 0*MoCA
+    L1.SPACE =~ PerformanceLog
+    PerformanceLog ~~ 0*PerformanceLog
+', rhs("L2", unique(c("L1.SPACE", "mean_fixation_count", b_keep_demog))), '
+', rhs("L1.SPACE", b_keep_phys), '
+')
+cat(final_model)   # check the syntax before fitting
+
+final_fit <- sem(final_model, data = sem.data, std.lv = TRUE,
+                 missing = "fiml", cluster = "Participant")
+summary(final_fit, standardized = TRUE, fit.measures = TRUE, rsquare = TRUE)
+```
+
+## Inspect the model
 
 ```{r}
 lavInspect(fit, "converged")
 lavInspect(fit, "post.check")          # flags Heywood cases / negative variances
 summary(fit, fit.measures = TRUE)      # look for warnings printed above the table
 fitmeasures(fit, c("cfi", "tli", "rmsea", "srmr"))
+semPlot::semPaths(fit, what = "std", layout = "tree",
+                   whatLabels = "std", edge.label.cex = 0.6,
+                   rotation = 2, nCharNodes = 0)
+parameterEstimates(fit, standardized = TRUE) %>%
+  filter(op %in% c("~", "=~")) %>%
+  select(level, lhs, op, rhs, est, se, pvalue, std.all)
+```
+```{r}
+drop_var <- "mean_saccadic_count"
+
+w_keep2      <- setdiff(w_keep, drop_var)
+b_keep_phys2 <- setdiff(b_keep_phys, drop_var)
+
+# Helper: builds "lhs ~ a + b" only if there are predictors (avoids a dangling "~")
+rhs <- function(lhs, vars) {
+  if (length(vars) == 0) return("")
+  paste0("    ", lhs, " ~ ", paste(vars, collapse = " + "))
+}
+
+model <- paste0('
+level: 1
+    L1.SPACE =~ PerformanceLog
+    PerformanceLog ~~ 0*PerformanceLog
+', rhs("L1.SPACE", w_keep2), '
+
+level: 2
+    L2 =~ MoCA
+    MoCA ~~ 0*MoCA
+    L1.SPACE =~ PerformanceLog
+    PerformanceLog ~~ 0*PerformanceLog
+', rhs("L2", c("L1.SPACE", b_keep_demog)), '
+', rhs("L1.SPACE", b_keep_phys2), '
+')
+
+cat(model)   # check the syntax looks right before fitting
+
+fit2 <- sem(model, data = sem.data, std.lv = TRUE,
+            missing = "fiml", cluster = "Participant")
+
+parameterEstimates(fit2, standardized = TRUE) %>%
+  filter(op %in% c("~", "=~")) %>%
+  select(level, lhs, op, rhs, est, se, pvalue, std.all)
+```
+
+
+
+```{r}
+lavInspect(fit2, "converged")
+lavInspect(fit2, "post.check")          # flags Heywood cases / negative variances
+summary(fit2, fit.measures = TRUE)      # look for warnings printed above the table
+fitmeasures(fit2, c("cfi", "tli", "rmsea", "srmr"))
 semPlot::semPaths(fit, what = "std", layout = "tree",
                    whatLabels = "std", edge.label.cex = 0.6,
                    rotation = 2, nCharNodes = 0)
